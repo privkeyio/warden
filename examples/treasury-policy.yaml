@@ -1,0 +1,42 @@
+version: "1.0"
+name: "treasury-spending-policy"
+description: "Controls treasury wallet outflows"
+
+rules:
+  - id: "block-sanctioned"
+    description: "Never send to OFAC sanctioned addresses"
+    conditions:
+      destination:
+        in_blacklist: "ofac-sanctioned"
+    action: DENY
+
+  - id: "small-whitelisted"
+    description: "Auto-approve small transfers to known addresses"
+    conditions:
+      source_wallets: ["treasury-hot-*"]
+      destination:
+        in_whitelist: "approved-vendors"
+      amount:
+        max_sats: 10000000
+    action: ALLOW
+
+  - id: "large-transfers"
+    description: "Require multi-party approval for large amounts"
+    conditions:
+      amount:
+        min_sats: 100000000
+    action: REQUIRE_APPROVAL
+    approval:
+      quorum: 2
+      from_groups: ["treasury-signers"]
+      timeout_hours: 24
+
+  - id: "default-review"
+    description: "Anything else needs review"
+    conditions: {}
+    action: REQUIRE_APPROVAL
+    approval:
+      quorum: 1
+      from_groups: ["ops-team"]
+
+default_action: DENY

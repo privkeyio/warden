@@ -1,0 +1,64 @@
+use axum::{
+    routing::{delete, get, post, put},
+    Router,
+};
+use tower_http::trace::TraceLayer;
+
+use crate::handlers;
+use crate::state::AppState;
+
+pub fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(handlers::health_check))
+        .nest("/v1", api_v1())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+fn api_v1() -> Router<AppState> {
+    Router::new()
+        .nest("/policies", policy_routes())
+        .nest("/transactions", transaction_routes())
+        .nest("/whitelists", whitelist_routes())
+        .nest("/blacklists", blacklist_routes())
+}
+
+fn policy_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(handlers::list_policies))
+        .route("/", post(handlers::create_policy))
+        .route("/evaluate", post(handlers::evaluate_policy))
+        .route("/{id}", get(handlers::get_policy))
+        .route("/{id}", put(handlers::update_policy))
+        .route("/{id}", delete(handlers::delete_policy))
+        .route("/{id}/activate", post(handlers::activate_policy))
+        .route("/{id}/deactivate", post(handlers::deactivate_policy))
+}
+
+fn transaction_routes() -> Router<AppState> {
+    Router::new().route("/authorize", post(handlers::authorize_transaction))
+}
+
+fn whitelist_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(handlers::list_whitelists))
+        .route("/", post(handlers::create_whitelist))
+        .route("/{name}", get(handlers::get_whitelist))
+        .route("/{name}/addresses", post(handlers::add_whitelist_address))
+        .route(
+            "/{name}/addresses/{address}",
+            delete(handlers::remove_whitelist_address),
+        )
+}
+
+fn blacklist_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(handlers::list_blacklists))
+        .route("/", post(handlers::create_blacklist))
+        .route("/{name}", get(handlers::get_blacklist))
+        .route("/{name}/addresses", post(handlers::add_blacklist_address))
+        .route(
+            "/{name}/addresses/{address}",
+            delete(handlers::remove_blacklist_address),
+        )
+}
