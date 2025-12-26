@@ -1,6 +1,6 @@
 # Warden
 
-Policy engine for Bitcoin custody operations.
+Policy engine and approval workflows for Bitcoin custody operations.
 
 ## Table of Contents
 
@@ -8,6 +8,7 @@ Policy engine for Bitcoin custody operations.
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
 - [Policy DSL](#policy-dsl)
+- [Approval Workflows](#approval-workflows)
 - [API](#api)
 - [Security](#security)
 - [Development](#development)
@@ -75,6 +76,9 @@ Data stored at `~/.local/share/warden`.
 | `warden blacklist create <name>` | Create address blacklist |
 | `warden blacklist add <name> <addr>` | Add address to blacklist |
 | `warden serve` | Start REST API server |
+| `warden group create <name>` | Create approver group |
+| `warden group add-member <group> <approver-id>` | Add member to group |
+| `warden group list` | List all groups |
 
 ---
 
@@ -131,6 +135,39 @@ default_action: DENY
 
 ---
 
+## Approval Workflows
+
+When a policy returns `REQUIRE_APPROVAL`, a workflow is created requiring t-of-n quorum:
+
+```yaml
+action: REQUIRE_APPROVAL
+approval:
+  quorum: 2
+  from_groups: ["treasury-signers"]
+  timeout_hours: 24
+```
+
+**Complex quorum with AND/OR composition:**
+
+```yaml
+approval:
+  requirement:
+    type: All
+    requirements:
+      - type: Threshold
+        threshold: 1
+        group: finance-team
+      - type: Threshold
+        threshold: 2
+        group: security-team
+```
+
+**Workflow states:** `PENDING` → `APPROVED` | `REJECTED` | `TIMED_OUT` | `CANCELLED`
+
+**Notifications:** Webhook (HMAC-signed), Email (SMTP), Slack, and Nostr DM supported.
+
+---
+
 ## API
 
 | Endpoint | Method | Description |
@@ -148,6 +185,12 @@ default_action: DENY
 | `/v1/whitelists` | GET/POST | Manage whitelists |
 | `/v1/whitelists/{name}/addresses` | POST/DELETE | Manage addresses |
 | `/v1/blacklists` | GET/POST | Manage blacklists |
+| `/v1/workflows/{id}` | GET | Get approval workflow status |
+| `/v1/workflows/{id}/approve` | POST | Submit approval |
+| `/v1/workflows/{id}/reject` | POST | Submit rejection |
+| `/v1/approvals/pending` | GET | List pending approvals for user |
+| `/v1/groups` | GET/POST | Manage approver groups |
+| `/v1/groups/{id}/members` | POST/DELETE | Manage group members |
 
 ---
 

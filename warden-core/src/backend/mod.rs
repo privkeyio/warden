@@ -94,6 +94,7 @@ pub trait SigningBackend: Send + Sync {
     async fn health_check(&self) -> Result<HealthStatus>;
     async fn get_public_key(&self, wallet_id: &WalletId) -> Result<PublicKey>;
     async fn initiate_signing(&self, request: SigningRequest) -> Result<SigningSession>;
+    async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession>;
     async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus>;
     async fn get_signature(&self, session_id: &SessionId) -> Result<Signature>;
     async fn cancel_session(&self, session_id: &SessionId) -> Result<()>;
@@ -209,6 +210,15 @@ impl SigningBackend for MockSigningBackend {
             .expect("lock poisoned")
             .insert(session.session_id, session.clone());
         Ok(session)
+    }
+
+    async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
+        self.sessions
+            .read()
+            .expect("lock poisoned")
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| Error::SessionNotFound(session_id.to_string()))
     }
 
     async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus> {

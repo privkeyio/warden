@@ -44,6 +44,27 @@ pub enum Error {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("workflow not found: {0}")]
+    WorkflowNotFound(String),
+
+    #[error("workflow not pending: {0}")]
+    WorkflowNotPending(String),
+
+    #[error("approver not authorized: {0}")]
+    ApproverNotAuthorized(String),
+
+    #[error("already approved: {0}")]
+    AlreadyApproved(String),
+
+    #[error("group not found: {0}")]
+    GroupNotFound(String),
+
+    #[error("notification error: {0}")]
+    Notification(String),
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 impl From<serde_yaml::Error> for Error {

@@ -21,12 +21,16 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
+reqwest = { workspace = true }
 regex = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
 bitcoin = { workspace = true }
 tokio = { workspace = true }
+lettre = { workspace = true }
+nostr-sdk = { workspace = true }
 directories = { workspace = true }
 
 [dev-dependencies]

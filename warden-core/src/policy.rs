@@ -270,6 +270,19 @@ pub struct HourRange {
     pub end: u32,
 }
 
+/// Configuration for multi-signature approval requirements.
+///
+/// When multiple groups are specified in `from_groups`, the approval uses OR semantics:
+/// the quorum must be satisfied entirely within a single group. Approvals cannot be
+/// mixed across groups to meet the threshold.
+///
+/// For example, with `quorum: 2` and `from_groups: ["treasury", "executives"]`:
+/// - 2 approvals from "treasury" members -> satisfied
+/// - 2 approvals from "executives" members -> satisfied
+/// - 1 approval from "treasury" + 1 from "executives" -> NOT satisfied
+///
+/// To allow mixing approvals across groups, use `RequirementNode::k_of` directly
+/// when constructing the workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     pub quorum: u32,

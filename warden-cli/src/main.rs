@@ -4,8 +4,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use warden_core::{
-    AddressListStore, BackendRegistry, Config, InMemoryAddressListStore, InMemoryPolicyStore,
-    MockSigningBackend, Policy, PolicyEvaluator, PolicyStore, RedbStorage, TransactionRequest,
+    AddressListStore, ApprovalDecision, ApprovalStore, ApproverGroup, BackendRegistry, Config,
+    GroupMember, GroupStore, InMemoryAddressListStore, InMemoryApprovalStore, InMemoryGroupStore,
+    InMemoryPolicyStore, InMemoryWorkflowStore, MockSigningBackend, Policy, PolicyEvaluator,
+    PolicyStore, RedbStorage, TimeoutChecker, TransactionRequest, WorkflowStore,
 };
 
 #[derive(Parser)]
@@ -45,6 +47,14 @@ enum Commands {
     Blacklist {
         #[command(subcommand)]
         action: ListAction,
+    },
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
+    },
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
     },
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -97,10 +107,65 @@ enum ListAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ApprovalAction {
+    List,
+    Get {
+        id: String,
+    },
+    Approve {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        approver: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    Reject {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        approver: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupAction {
+    List,
+    Get {
+        name: String,
+    },
+    Create {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    AddMember {
+        group: String,
+        #[arg(long)]
+        approver: String,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    RemoveMember {
+        group: String,
+        approver: String,
+    },
+}
+
 struct Stores {
     policy_store: Arc<dyn PolicyStore>,
     whitelist_store: Arc<dyn AddressListStore>,
     blacklist_store: Arc<dyn AddressListStore>,
+    approval_store: Arc<dyn ApprovalStore>,
+    workflow_store: Arc<dyn WorkflowStore>,
+    group_store: Arc<dyn GroupStore>,
     backend_registry: Arc<BackendRegistry>,
     _storage: Option<RedbStorage>,
 }
@@ -114,6 +179,9 @@ impl Stores {
             policy_store: Arc::new(InMemoryPolicyStore::new()),
             whitelist_store: Arc::new(InMemoryAddressListStore::new()),
             blacklist_store: Arc::new(InMemoryAddressListStore::new()),
+            approval_store: Arc::new(InMemoryApprovalStore::new()),
+            workflow_store: Arc::new(InMemoryWorkflowStore::new()),
+            group_store: Arc::new(InMemoryGroupStore::new()),
             backend_registry,
             _storage: None,
         }
@@ -130,6 +198,9 @@ impl Stores {
             policy_store: Arc::new(storage.policy_store()),
             whitelist_store: Arc::new(storage.address_list_store()),
             blacklist_store: Arc::new(storage.address_list_store()),
+            approval_store: Arc::new(storage.approval_store()),
+            workflow_store: Arc::new(storage.workflow_store()),
+            group_store: Arc::new(storage.group_store()),
             backend_registry,
             _storage: Some(storage),
         })
@@ -287,11 +358,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Blacklist { action } => {
             handle_list_action(action, &stores.blacklist_store).await?
         }
+        Commands::Approval { action } => {
+            handle_approval_action(action, &stores.workflow_store, &stores.group_store).await?
+        }
+        Commands::Group { action } => handle_group_action(action, &stores.group_store).await?,
         Commands::Serve { host, port } => {
+            let timeout_checker = Arc::new(TimeoutChecker::new(Arc::clone(&stores.workflow_store)));
+            let timeout_handle = Arc::clone(&timeout_checker).spawn();
+            tracing::info!("Started workflow timeout checker");
+
             let state = warden_api::AppState::new(
                 stores.policy_store,
                 stores.whitelist_store,
                 stores.blacklist_store,
+                stores.approval_store,
+                stores.workflow_store,
+                stores.group_store,
                 stores.backend_registry,
             );
             let app = warden_api::create_router(state);
@@ -299,7 +381,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Starting Warden API server on {}", addr);
             println!("Data directory: {}", config.data_dir.display());
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            axum::serve(listener, app).await?;
+            let result = axum::serve(listener, app).await;
+            timeout_handle.abort();
+            result?;
         }
     }
 
@@ -337,6 +421,234 @@ async fn handle_list_action(
         ListAction::Remove { name, address } => {
             store.remove_address(&name, &address).await?;
             println!("Removed {} from {}", address, name);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_approval_action(
+    action: ApprovalAction,
+    workflow_store: &Arc<dyn WorkflowStore>,
+    group_store: &Arc<dyn GroupStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        ApprovalAction::List => {
+            let workflows = workflow_store.list_pending_workflows().await?;
+            if workflows.is_empty() {
+                println!("No pending workflows");
+            } else {
+                for w in workflows {
+                    println!(
+                        "{} [{}] {} sats -> {} (expires: {})",
+                        w.id,
+                        format!("{:?}", w.status).to_uppercase(),
+                        w.transaction_details.amount_sats,
+                        w.transaction_details.destination,
+                        w.expires_at.format("%Y-%m-%d %H:%M UTC")
+                    );
+                }
+            }
+        }
+        ApprovalAction::Get { id } => {
+            let uuid = uuid::Uuid::parse_str(&id)?;
+            if let Some(workflow) = workflow_store.get_workflow(&uuid).await? {
+                println!("Workflow: {}", workflow.id);
+                println!("Status: {:?}", workflow.status);
+                println!("Transaction: {}", workflow.transaction_id);
+                println!(
+                    "Amount: {} sats ({:.8} BTC)",
+                    workflow.transaction_details.amount_sats,
+                    workflow.transaction_details.amount_btc()
+                );
+                println!("From: {}", workflow.transaction_details.source_wallet);
+                println!("To: {}", workflow.transaction_details.destination);
+                println!("Created: {}", workflow.created_at);
+                println!("Expires: {}", workflow.expires_at);
+                println!("\nApprovals ({}):", workflow.approvals.len());
+                for a in &workflow.approvals {
+                    println!(
+                        "  {} ({}) - {:?} at {}",
+                        a.approver_id, a.approver_role, a.decision, a.created_at
+                    );
+                }
+                println!("\nQuorum Status: {:?}", workflow.quorum_status());
+            } else {
+                eprintln!("Workflow not found: {}", id);
+            }
+        }
+        ApprovalAction::Approve {
+            workflow,
+            approver,
+            role,
+            comment,
+        } => {
+            let uuid = uuid::Uuid::parse_str(&workflow)?;
+            let groups = group_store.get_groups_for_approver(&approver).await?;
+            let group_names: Vec<_> = groups.iter().map(|g| g.name.clone()).collect();
+
+            if let Some(w) = workflow_store.get_workflow(&uuid).await? {
+                if !w.can_approve(&approver, &group_names) {
+                    eprintln!("Approver {} is not authorized for this workflow", approver);
+                    std::process::exit(1);
+                }
+
+                let required_groups = w.requirement.all_groups();
+                let valid_role = if required_groups.contains(&role) && group_names.contains(&role) {
+                    role.clone()
+                } else {
+                    group_names
+                        .iter()
+                        .find(|g| required_groups.contains(*g))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "Approver {} has no valid role for this workflow. User groups: {:?}, required groups: {:?}",
+                                approver, group_names, required_groups
+                            )
+                        })?
+                };
+
+                let mut approval = warden_core::Approval::new(
+                    approver.clone(),
+                    valid_role.clone(),
+                    ApprovalDecision::Approve,
+                    0,
+                );
+                if let Some(c) = comment {
+                    approval = approval.with_comment(c);
+                }
+
+                let updated = workflow_store
+                    .add_approval_to_workflow(&uuid, approval)
+                    .await?;
+                println!("Approval submitted by {} ({})", approver, valid_role);
+                println!("Workflow status: {:?}", updated.status);
+            } else {
+                eprintln!("Workflow not found: {}", workflow);
+            }
+        }
+        ApprovalAction::Reject {
+            workflow,
+            approver,
+            role,
+            reason,
+        } => {
+            let uuid = uuid::Uuid::parse_str(&workflow)?;
+            let groups = group_store.get_groups_for_approver(&approver).await?;
+            let group_names: Vec<_> = groups.iter().map(|g| g.name.clone()).collect();
+
+            if let Some(w) = workflow_store.get_workflow(&uuid).await? {
+                if !w.can_approve(&approver, &group_names) {
+                    eprintln!("Approver {} is not authorized for this workflow", approver);
+                    std::process::exit(1);
+                }
+
+                let required_groups = w.requirement.all_groups();
+                let valid_role = if required_groups.contains(&role) && group_names.contains(&role) {
+                    role.clone()
+                } else {
+                    group_names
+                        .iter()
+                        .find(|g| required_groups.contains(*g))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "Approver {} has no valid role for this workflow. User groups: {:?}, required groups: {:?}",
+                                approver, group_names, required_groups
+                            )
+                        })?
+                };
+
+                let mut rejection = warden_core::Approval::new(
+                    approver.clone(),
+                    valid_role.clone(),
+                    ApprovalDecision::Reject,
+                    0,
+                );
+                if let Some(r) = reason {
+                    rejection = rejection.with_comment(r);
+                }
+
+                let updated = workflow_store
+                    .add_approval_to_workflow(&uuid, rejection)
+                    .await?;
+                println!("Rejection submitted by {} ({})", approver, valid_role);
+                println!("Workflow status: {:?}", updated.status);
+            } else {
+                eprintln!("Workflow not found: {}", workflow);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_group_action(
+    action: GroupAction,
+    group_store: &Arc<dyn GroupStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        GroupAction::List => {
+            let groups = group_store.list().await?;
+            if groups.is_empty() {
+                println!("No groups found");
+            } else {
+                for g in groups {
+                    println!("{} ({} members)", g.name, g.members.len());
+                }
+            }
+        }
+        GroupAction::Get { name } => {
+            if let Some(group) = group_store.get_by_name(&name).await? {
+                println!("Group: {}", group.name);
+                if let Some(desc) = &group.description {
+                    println!("Description: {}", desc);
+                }
+                println!("Created: {}", group.created_at);
+                println!("\nMembers ({}):", group.members.len());
+                for m in &group.members {
+                    let display = m
+                        .display_name
+                        .as_ref()
+                        .map(|n| format!(" ({})", n))
+                        .unwrap_or_default();
+                    println!("  {}{} - added {}", m.approver_id, display, m.added_at);
+                }
+            } else {
+                eprintln!("Group not found: {}", name);
+            }
+        }
+        GroupAction::Create { name, description } => {
+            let mut group = ApproverGroup::new(name.clone());
+            if let Some(desc) = description {
+                group = group.with_description(desc);
+            }
+            let created = group_store.create(group).await?;
+            println!("Created group: {} (id: {})", created.name, created.id);
+        }
+        GroupAction::AddMember {
+            group,
+            approver,
+            display_name,
+        } => {
+            if let Some(g) = group_store.get_by_name(&group).await? {
+                let mut member = GroupMember::new(approver.clone());
+                if let Some(name) = display_name {
+                    member = member.with_display_name(name);
+                }
+
+                group_store.add_member(&g.id, member).await?;
+                println!("Added {} to group {}", approver, group);
+            } else {
+                eprintln!("Group not found: {}", group);
+            }
+        }
+        GroupAction::RemoveMember { group, approver } => {
+            if let Some(g) = group_store.get_by_name(&group).await? {
+                group_store.remove_member(&g.id, &approver).await?;
+                println!("Removed {} from group {}", approver, group);
+            } else {
+                eprintln!("Group not found: {}", group);
+            }
         }
     }
     Ok(())

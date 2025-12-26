@@ -22,6 +22,7 @@ mod implementation {
     use keep_core::frost::SharePackage;
     use keep_frost_net::KfpNode;
     use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -29,6 +30,7 @@ mod implementation {
         node: Arc<KfpNode>,
         threshold: u16,
         node_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+        sessions: RwLock<HashMap<SessionId, SigningSession>>,
     }
 
     impl KeepFrostBackend {
@@ -42,6 +44,7 @@ mod implementation {
                 node: Arc::new(node),
                 threshold,
                 node_handle: RwLock::new(None),
+                sessions: RwLock::new(HashMap::new()),
             })
         }
 
@@ -58,6 +61,12 @@ mod implementation {
 
         pub fn node(&self) -> &Arc<KfpNode> {
             &self.node
+        }
+
+        async fn cleanup_expired_sessions(&self) {
+            let now = Utc::now();
+            let mut sessions = self.sessions.write().await;
+            sessions.retain(|_, session| session.expires_at > now);
         }
     }
 
@@ -86,6 +95,8 @@ mod implementation {
         }
 
         async fn initiate_signing(&self, request: SigningRequest) -> Result<SigningSession> {
+            self.cleanup_expired_sessions().await;
+
             let message = match &request.payload {
                 SigningPayload::Psbt(psbt) => {
                     let mut hasher = Sha256::new();
@@ -116,24 +127,56 @@ mod implementation {
 
             let session_id = SessionId::new_v4();
 
-            Ok(SigningSession {
+            let session = SigningSession {
                 session_id,
                 status: SessionStatus::Completed,
                 signature: Some(Signature::Schnorr(signature)),
                 created_at: Utc::now(),
                 expires_at: Utc::now() + Duration::seconds(request.timeout.as_secs() as i64),
-            })
+            };
+
+            self.sessions
+                .write()
+                .await
+                .insert(session_id, session.clone());
+
+            Ok(session)
         }
 
-        async fn get_session_status(&self, _session_id: &SessionId) -> Result<SessionStatus> {
-            Ok(SessionStatus::Completed)
+        async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
+            self.sessions
+                .read()
+                .await
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| Error::SessionNotFound(session_id.to_string()))
+        }
+
+        async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus> {
+            self.sessions
+                .read()
+                .await
+                .get(session_id)
+                .map(|s| s.status.clone())
+                .ok_or_else(|| Error::SessionNotFound(session_id.to_string()))
         }
 
         async fn get_signature(&self, session_id: &SessionId) -> Result<Signature> {
-            Err(Error::SessionNotFound(session_id.to_string()))
+            let sessions = self.sessions.read().await;
+            match sessions.get(session_id) {
+                Some(s) => s
+                    .signature
+                    .clone()
+                    .ok_or_else(|| Error::SignatureNotReady(session_id.to_string())),
+                None => Err(Error::SessionNotFound(session_id.to_string())),
+            }
         }
 
-        async fn cancel_session(&self, _session_id: &SessionId) -> Result<()> {
+        async fn cancel_session(&self, session_id: &SessionId) -> Result<()> {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.status = SessionStatus::Cancelled;
+            }
             Ok(())
         }
     }
@@ -174,6 +217,10 @@ impl SigningBackend for StubKeepBackend {
 
     async fn initiate_signing(&self, _request: SigningRequest) -> Result<SigningSession> {
         Err(Error::Backend("Keep integration not enabled".into()))
+    }
+
+    async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
+        Err(Error::SessionNotFound(session_id.to_string()))
     }
 
     async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus> {
