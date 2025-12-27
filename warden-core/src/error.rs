@@ -65,6 +65,21 @@ pub enum Error {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("bundle verification error: {0}")]
+    BundleVerification(String),
+
+    #[error("enclave error: {0}")]
+    Enclave(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    #[error("callback error: {0}")]
+    Callback(String),
+
+    #[error("audit error: {0}")]
+    Audit(String),
 }
 
 impl From<serde_yaml::Error> for Error {

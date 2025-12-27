@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
 
 pub mod approval;
+pub mod audit;
 pub mod backend;
+pub mod bundle;
+pub mod callback;
+pub mod compliance;
 pub mod config;
+pub mod enclave;
 pub mod error;
+pub mod escalation;
 pub mod evaluator;
 pub mod group;
 pub mod notification;
@@ -61,4 +67,38 @@ pub use velocity::{
 };
 pub use workflow::{
     CompletionCallback, LoggingCallback, TimeoutChecker, WorkflowCompletionHandler,
+};
+
+pub use audit::{
+    ActorInfo, ActorType, AuditEvent, AuditEventType, AuditLog, AuditQuery, AuditStore,
+    ChainVerification, ComplianceExporter, DateRange, EventId, InMemoryAuditStore, ResourceInfo,
+    SOC2AuditReport,
+};
+pub use bundle::{
+    BundleContents, BundleLoader, BundleManifest, BundleProof, BundleSignature, BundleSigner,
+    BundleStore, Hash, InMemoryBundleStore, LoadedBundle, MerkleLeaf, MerkleProof, MerkleTree,
+    MockBundleSigner, ProofElement, SigningPayload as BundleSigningPayload,
+};
+pub use callback::{
+    CallbackAction, CallbackConfig, CallbackDecision, CallbackError, CallbackGateway,
+    CallbackHandlerConfig, CallbackRequest, CallbackResponse, CallbackResult, CallbackRuleConfig,
+    PolicyContext, TransactionDetails as CallbackTransactionDetails,
+};
+pub use compliance::{
+    AlertSeverity as ComplianceAlertSeverity, ChainalysisClient, ChainalysisConfig,
+    ComplianceAlert, ComplianceCallbackHandler, ComplianceError, ComplianceProvider,
+    EllipticClient, EllipticConfig, ExposureCategory, ExposureInfo, MockComplianceProvider,
+    ScreeningResult,
+};
+pub use enclave::{
+    BundleData, EnclaveClient, EnclaveConfig, EnclaveDecision, EnclaveProxy, EnclaveRequest,
+    EnclaveResponse, ErrorCode as EnclaveErrorCode, EvaluationRequest,
+    EvaluationResult as EnclaveEvaluationResult, ExpectedPcrs, MockEnclaveClient, PcrConfig,
+    SessionStatus as EnclaveSessionStatus, SigningInitRequest,
+    SigningSession as EnclaveSigningSession, VerifiedAttestation, ENCLAVE_CID, VSOCK_PORT,
+};
+pub use escalation::{
+    AlertSeverity, EscalationAction, EscalationManager, EscalationOutcome, EscalationPolicy,
+    EscalationPolicyStore, EscalationResults, EscalationStage, FinalAction,
+    InMemoryEscalationPolicyStore, PendingWorkflow, WorkflowClient,
 };

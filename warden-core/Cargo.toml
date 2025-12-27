@@ -6,11 +6,12 @@ license.workspace = true
 
 [features]
 default = []
-keep = ["dep:keep-core", "dep:keep-frost-net"]
+keep = ["dep:keep-core", "dep:keep-frost-net", "dep:keep-enclave-host"]
 
 [dependencies]
 keep-core = { workspace = true, optional = true }
 keep-frost-net = { workspace = true, optional = true }
+keep-enclave-host = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -32,6 +33,8 @@ tokio = { workspace = true }
 lettre = { workspace = true }
 nostr-sdk = { workspace = true }
 directories = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
