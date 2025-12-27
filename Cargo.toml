@@ -32,8 +32,12 @@ clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 regex = "1"
+reqwest = { version = "0.12.8", features = ["json"] }
+nostr-sdk = { version = "0.38", default-features = false, features = ["nip59"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 indexmap = "2"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tempfile = "3.10"

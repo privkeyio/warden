@@ -7,6 +7,11 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 use super::{AddressEntry, AddressListStore, PolicyStore};
+use crate::approval::{
+    Approval, ApprovalRequest, ApprovalStatus, ApprovalStore, ApprovalWorkflow, WorkflowStatus,
+    WorkflowStore,
+};
+use crate::group::{ApproverGroup, GroupMember, GroupStore};
 use crate::pattern::matches_pattern;
 use crate::policy::Policy;
 use crate::{Error, Result};
@@ -14,6 +19,9 @@ use crate::{Error, Result};
 const POLICIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("policies");
 const WALLET_BINDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_bindings");
 const ADDRESS_LISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("address_lists");
+const WORKFLOWS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("workflows");
+const GROUPS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("groups");
+const APPROVALS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("approvals");
 
 pub struct RedbStorage {
     db: Arc<Database>,
@@ -32,6 +40,12 @@ impl RedbStorage {
             wtxn.open_table(WALLET_BINDINGS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             wtxn.open_table(ADDRESS_LISTS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            wtxn.open_table(WORKFLOWS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            wtxn.open_table(GROUPS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            wtxn.open_table(APPROVALS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
         }
@@ -52,6 +66,24 @@ impl RedbStorage {
 
     pub fn address_list_store(&self) -> RedbAddressListStore {
         RedbAddressListStore {
+            db: Arc::clone(&self.db),
+        }
+    }
+
+    pub fn workflow_store(&self) -> RedbWorkflowStore {
+        RedbWorkflowStore {
+            db: Arc::clone(&self.db),
+        }
+    }
+
+    pub fn group_store(&self) -> RedbGroupStore {
+        RedbGroupStore {
+            db: Arc::clone(&self.db),
+        }
+    }
+
+    pub fn approval_store(&self) -> RedbApprovalStore {
+        RedbApprovalStore {
             db: Arc::clone(&self.db),
         }
     }
@@ -518,6 +550,442 @@ impl AddressListStore for RedbAddressListStore {
             bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
 
         Ok(data.addresses)
+    }
+}
+
+pub struct RedbWorkflowStore {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl WorkflowStore for RedbWorkflowStore {
+    async fn create_workflow(&self, workflow: ApprovalWorkflow) -> Result<ApprovalWorkflow> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut table = wtxn
+                .open_table(WORKFLOWS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let key = workflow.id.as_bytes();
+            let value = bincode::serialize(&workflow).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(workflow)
+    }
+
+    async fn get_workflow(&self, id: &Uuid) -> Result<Option<ApprovalWorkflow>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(WORKFLOWS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let key = id.as_bytes();
+        match table
+            .get(key.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            Some(value) => {
+                let workflow: ApprovalWorkflow = bincode::deserialize(value.value())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                Ok(Some(workflow))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_workflow_by_transaction(
+        &self,
+        transaction_id: &Uuid,
+    ) -> Result<Option<ApprovalWorkflow>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(WORKFLOWS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            if workflow.transaction_id == *transaction_id {
+                return Ok(Some(workflow));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn update_workflow(&self, workflow: ApprovalWorkflow) -> Result<ApprovalWorkflow> {
+        self.create_workflow(workflow).await
+    }
+
+    async fn list_pending_workflows(&self) -> Result<Vec<ApprovalWorkflow>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(WORKFLOWS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut workflows = Vec::new();
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            if workflow.status == WorkflowStatus::Pending {
+                workflows.push(workflow);
+            }
+        }
+        Ok(workflows)
+    }
+
+    async fn list_pending_for_approver(
+        &self,
+        _approver_id: &str,
+        groups: &[String],
+    ) -> Result<Vec<ApprovalWorkflow>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(WORKFLOWS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut workflows = Vec::new();
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            if workflow.status == WorkflowStatus::Pending {
+                let required_groups = workflow.requirement.all_groups();
+                if groups.iter().any(|g| required_groups.contains(g)) {
+                    workflows.push(workflow);
+                }
+            }
+        }
+        Ok(workflows)
+    }
+
+    async fn add_approval_to_workflow(
+        &self,
+        workflow_id: &Uuid,
+        approval: Approval,
+    ) -> Result<ApprovalWorkflow> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let workflow = {
+            let mut table = wtxn
+                .open_table(WORKFLOWS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            let key = workflow_id.as_bytes();
+            let mut workflow: ApprovalWorkflow = table
+                .get(key.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .ok_or_else(|| Error::WorkflowNotFound(workflow_id.to_string()))
+                .and_then(|v| {
+                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
+                })?;
+
+            workflow.add_approval(approval);
+
+            let value = bincode::serialize(&workflow).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            workflow
+        };
+
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(workflow)
+    }
+}
+
+pub struct RedbGroupStore {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl GroupStore for RedbGroupStore {
+    async fn create(&self, group: ApproverGroup) -> Result<ApproverGroup> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut table = wtxn
+                .open_table(GROUPS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let key = group.id.as_bytes();
+            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(group)
+    }
+
+    async fn get(&self, id: &Uuid) -> Result<Option<ApproverGroup>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(GROUPS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let key = id.as_bytes();
+        match table
+            .get(key.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            Some(value) => {
+                let group: ApproverGroup = bincode::deserialize(value.value())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                Ok(Some(group))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_by_name(&self, name: &str) -> Result<Option<ApproverGroup>> {
+        let groups = self.list().await?;
+        Ok(groups.into_iter().find(|g| g.name == name))
+    }
+
+    async fn list(&self) -> Result<Vec<ApproverGroup>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(GROUPS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut groups = Vec::new();
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let group: ApproverGroup =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            groups.push(group);
+        }
+        Ok(groups)
+    }
+
+    async fn update(&self, group: ApproverGroup) -> Result<ApproverGroup> {
+        self.create(group).await
+    }
+
+    async fn delete(&self, id: &Uuid) -> Result<()> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut table = wtxn
+                .open_table(GROUPS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let key = id.as_bytes();
+            table
+                .remove(key.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn add_member(&self, group_id: &Uuid, member: GroupMember) -> Result<ApproverGroup> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let group = {
+            let mut table = wtxn
+                .open_table(GROUPS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            let key = group_id.as_bytes();
+            let mut group: ApproverGroup = table
+                .get(key.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
+                .and_then(|v| {
+                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
+                })?;
+
+            if !group
+                .members
+                .iter()
+                .any(|m| m.approver_id == member.approver_id)
+            {
+                group.members.push(member);
+                group.updated_at = chrono::Utc::now();
+            }
+
+            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            group
+        };
+
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(group)
+    }
+
+    async fn remove_member(&self, group_id: &Uuid, approver_id: &str) -> Result<ApproverGroup> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let group = {
+            let mut table = wtxn
+                .open_table(GROUPS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            let key = group_id.as_bytes();
+            let mut group: ApproverGroup = table
+                .get(key.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
+                .and_then(|v| {
+                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
+                })?;
+
+            group.members.retain(|m| m.approver_id != approver_id);
+            group.updated_at = chrono::Utc::now();
+
+            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            group
+        };
+
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(group)
+    }
+
+    async fn get_groups_for_approver(&self, approver_id: &str) -> Result<Vec<ApproverGroup>> {
+        let groups = self.list().await?;
+        Ok(groups
+            .into_iter()
+            .filter(|g| g.members.iter().any(|m| m.approver_id == approver_id))
+            .collect())
+    }
+}
+
+pub struct RedbApprovalStore {
+    db: Arc<Database>,
+}
+
+#[async_trait]
+impl ApprovalStore for RedbApprovalStore {
+    async fn create(&self, request: ApprovalRequest) -> Result<ApprovalRequest> {
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut table = wtxn
+                .open_table(APPROVALS_TABLE)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let key = request.id.as_bytes();
+            let value = bincode::serialize(&request).map_err(|e| Error::Storage(e.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(request)
+    }
+
+    async fn get(&self, id: &Uuid) -> Result<Option<ApprovalRequest>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(APPROVALS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let key = id.as_bytes();
+        match table
+            .get(key.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            Some(value) => {
+                let request: ApprovalRequest = bincode::deserialize(value.value())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                Ok(Some(request))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_by_transaction(&self, transaction_id: &Uuid) -> Result<Option<ApprovalRequest>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(APPROVALS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let request: ApprovalRequest =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            if request.transaction_id == *transaction_id {
+                return Ok(Some(request));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn update(&self, request: ApprovalRequest) -> Result<ApprovalRequest> {
+        self.create(request).await
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ApprovalRequest>> {
+        let rtxn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let table = rtxn
+            .open_table(APPROVALS_TABLE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut requests = Vec::new();
+        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            let request: ApprovalRequest =
+                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            if request.status == ApprovalStatus::Pending {
+                requests.push(request);
+            }
+        }
+        Ok(requests)
     }
 }
 

@@ -19,6 +19,9 @@ fn api_v1() -> Router<AppState> {
     Router::new()
         .nest("/policies", policy_routes())
         .nest("/transactions", transaction_routes())
+        .nest("/approvals", approval_routes())
+        .nest("/workflows", workflow_routes())
+        .nest("/groups", group_routes())
         .nest("/whitelists", whitelist_routes())
         .nest("/blacklists", blacklist_routes())
 }
@@ -36,7 +39,38 @@ fn policy_routes() -> Router<AppState> {
 }
 
 fn transaction_routes() -> Router<AppState> {
-    Router::new().route("/authorize", post(handlers::authorize_transaction))
+    Router::new()
+        .route("/authorize", post(handlers::authorize_transaction))
+        .route(
+            "/{id}/approval-status",
+            get(handlers::get_transaction_approval_status),
+        )
+        .route("/{id}/approve", post(handlers::approve_transaction))
+        .route("/{id}/reject", post(handlers::reject_transaction))
+}
+
+fn approval_routes() -> Router<AppState> {
+    Router::new().route("/pending", get(handlers::list_pending_approvals))
+}
+
+fn workflow_routes() -> Router<AppState> {
+    Router::new()
+        .route("/{id}", get(handlers::get_workflow_status))
+        .route("/{id}/approve", post(handlers::submit_approval))
+        .route("/{id}/reject", post(handlers::submit_rejection))
+        .route("/{id}/cancel", post(handlers::cancel_workflow))
+}
+
+fn group_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(handlers::list_groups))
+        .route("/", post(handlers::create_group))
+        .route("/{id}", get(handlers::get_group))
+        .route("/{id}/members", post(handlers::add_group_member))
+        .route(
+            "/{id}/members/{approver_id}",
+            delete(handlers::remove_group_member),
+        )
 }
 
 fn whitelist_routes() -> Router<AppState> {

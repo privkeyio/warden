@@ -38,6 +38,27 @@ pub fn validate_name(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
+pub fn validate_approver_id(id: &str) -> crate::Result<()> {
+    if id.is_empty() {
+        return Err(crate::Error::PolicyValidation(
+            "approver_id cannot be empty".into(),
+        ));
+    }
+    if id.len() > 256 {
+        return Err(crate::Error::PolicyValidation(
+            "approver_id must be 256 chars or less".into(),
+        ));
+    }
+    if !id.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' || c == ':'
+    }) {
+        return Err(crate::Error::PolicyValidation(
+            "approver_id contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
