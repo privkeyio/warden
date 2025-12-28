@@ -250,7 +250,7 @@ async fn test_evaluation_trace() {
     assert!(result.trace[1].matched, "rule-2 should match (catch-all)");
 }
 
-mod phase2_approval_workflows {
+mod approval_workflows {
     use chrono::Duration;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1339,5 +1339,643 @@ mod phase2_approval_workflows {
             0,
         )];
         assert!(!evaluator.evaluate(&requirement, &cfo_only).is_satisfied());
+    }
+}
+
+mod production_hardening {
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+    use warden_core::{
+        ActorInfo, ActorType, AuditEventType, AuditLog, AuditQuery, BundleContents, BundleLoader,
+        BundleManifest, BundleSignature, CallbackAction, CallbackGateway, CallbackHandlerConfig,
+        CallbackRuleConfig, ChainVerification, ComplianceExporter, ComplianceProvider,
+        EnclaveClient, EnclaveConfig, EnclaveDecision, EscalationAction, EscalationManager,
+        EscalationPolicy, EscalationPolicyStore, EscalationStage, EvaluationRequest, ExpectedPcrs,
+        FinalAction, Hash, InMemoryAuditStore, InMemoryBundleStore, InMemoryEscalationPolicyStore,
+        MerkleTree, MockBundleSigner, MockComplianceProvider, MockEnclaveClient, PendingWorkflow,
+        ResourceInfo, TransactionRequest, WorkflowClient,
+    };
+
+    #[test]
+    fn test_merkle_tree_construction_and_verification() {
+        let files = vec![
+            (
+                "policies/treasury.yaml".to_string(),
+                b"policy content 1".to_vec(),
+            ),
+            (
+                "policies/operations.yaml".to_string(),
+                b"policy content 2".to_vec(),
+            ),
+            (
+                "data/whitelist.json".to_string(),
+                b"[\"addr1\", \"addr2\"]".to_vec(),
+            ),
+        ];
+
+        let tree = MerkleTree::build(&files);
+        assert_eq!(tree.leaves().len(), 3);
+
+        for (path, _) in &files {
+            let proof = tree.prove(path).expect("Proof should exist");
+            assert!(MerkleTree::verify(&tree.root(), &proof));
+        }
+
+        let missing_proof = tree.prove("nonexistent.yaml");
+        assert!(missing_proof.is_none());
+    }
+
+    #[test]
+    fn test_merkle_tree_tamper_detection() {
+        let files = vec![
+            ("a.yaml".to_string(), b"content a".to_vec()),
+            ("b.yaml".to_string(), b"content b".to_vec()),
+        ];
+
+        let tree = MerkleTree::build(&files);
+        let proof = tree.prove("a.yaml").unwrap();
+
+        let tampered_root: Hash = [0u8; 32];
+        assert!(!MerkleTree::verify(&tampered_root, &proof));
+
+        assert!(MerkleTree::verify(&tree.root(), &proof));
+    }
+
+    #[tokio::test]
+    async fn test_bundle_loader_signature_verification() {
+        let store = InMemoryBundleStore::new();
+        let signer = MockBundleSigner::new()
+            .with_key("admin-key-1", b"secret1".to_vec())
+            .with_key("admin-key-2", b"secret2".to_vec());
+
+        let loader = BundleLoader::new(store, signer);
+
+        let current = loader.current().await;
+        assert!(current.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_audit_log_cryptographic_chaining() {
+        let store = InMemoryAuditStore::new();
+        let log = AuditLog::new(store).await.unwrap();
+
+        log.record(
+            AuditEventType::SystemStarted {
+                version: "1.0.0".into(),
+            },
+            None,
+            ResourceInfo::system(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        log.record(
+            AuditEventType::PolicyCreated {
+                policy_id: "policy-1".into(),
+                version: "1.0.0".into(),
+            },
+            Some(ActorInfo {
+                actor_type: ActorType::User,
+                id: "admin".into(),
+                ip_address: Some("192.168.1.1".into()),
+                user_agent: None,
+            }),
+            ResourceInfo::policy("policy-1"),
+            serde_json::json!({"description": "Test policy"}),
+        )
+        .await
+        .unwrap();
+
+        log.record(
+            AuditEventType::TransactionSubmitted {
+                transaction_id: "tx-123".into(),
+            },
+            None,
+            ResourceInfo::transaction("tx-123"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let verification = log.verify_chain(1).await.unwrap();
+        match verification {
+            ChainVerification::Valid { events_checked, .. } => {
+                assert_eq!(events_checked, 3);
+            }
+            _ => panic!("Chain should be valid"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_audit_query_filtering() {
+        let store = InMemoryAuditStore::new();
+        let log = AuditLog::new(store).await.unwrap();
+
+        log.record(
+            AuditEventType::TransactionSubmitted {
+                transaction_id: "tx-1".into(),
+            },
+            Some(ActorInfo {
+                actor_type: ActorType::User,
+                id: "alice".into(),
+                ip_address: None,
+                user_agent: None,
+            }),
+            ResourceInfo::transaction("tx-1"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        log.record(
+            AuditEventType::TransactionSubmitted {
+                transaction_id: "tx-2".into(),
+            },
+            Some(ActorInfo {
+                actor_type: ActorType::User,
+                id: "bob".into(),
+                ip_address: None,
+                user_agent: None,
+            }),
+            ResourceInfo::transaction("tx-2"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let alice_events = log
+            .query(&AuditQuery {
+                actor_id: Some("alice".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_events.len(), 1);
+
+        let tx1_events = log
+            .query(&AuditQuery {
+                resource_id: Some("tx-1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(tx1_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_compliance_exporter_soc2() {
+        let store = InMemoryAuditStore::new();
+        let log = AuditLog::new(store).await.unwrap();
+
+        log.record(
+            AuditEventType::PolicyCreated {
+                policy_id: "p1".into(),
+                version: "1.0".into(),
+            },
+            None,
+            ResourceInfo::policy("p1"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        log.record(
+            AuditEventType::ApprovalReceived {
+                transaction_id: "tx-1".into(),
+                approver_id: "alice".into(),
+                decision: "approve".into(),
+            },
+            None,
+            ResourceInfo::transaction("tx-1"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        log.record(
+            AuditEventType::SigningFailed {
+                transaction_id: "tx-2".into(),
+                error: "timeout".into(),
+            },
+            None,
+            ResourceInfo::transaction("tx-2"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let exporter = ComplianceExporter::new(log);
+        let report = exporter
+            .export_soc2(
+                Utc::now() - Duration::hours(1),
+                Utc::now() + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(!report.change_management.is_empty());
+        assert!(!report.access_controls.is_empty());
+        assert!(!report.incident_response.is_empty());
+        assert_eq!(report.chain_verification.status, "valid");
+    }
+
+    #[test]
+    fn test_callback_handler_config() {
+        let config = CallbackHandlerConfig {
+            id: "chainalysis-screening".into(),
+            url: "https://compliance.example.com/callback".into(),
+            public_key: Some("-----BEGIN PUBLIC KEY-----...".into()),
+            timeout_seconds: 30,
+            enabled: true,
+            max_retries: 3,
+        };
+
+        assert!(config.enabled);
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_callback_rule_config() {
+        let config = CallbackRuleConfig {
+            handler: "chainalysis-screening".into(),
+            on_approve: CallbackAction::Allow,
+            on_reject: CallbackAction::Deny,
+            on_timeout: CallbackAction::RequireApproval,
+            timeout_seconds: 30,
+        };
+
+        assert_eq!(config.on_approve, CallbackAction::Allow);
+        assert_eq!(config.on_reject, CallbackAction::Deny);
+        assert_eq!(config.on_timeout, CallbackAction::RequireApproval);
+    }
+
+    #[tokio::test]
+    async fn test_callback_gateway_handler_registration() {
+        let mut gateway = CallbackGateway::new();
+
+        gateway.register_handler(CallbackHandlerConfig {
+            id: "handler-1".into(),
+            url: "https://handler1.example.com".into(),
+            public_key: None,
+            timeout_seconds: 30,
+            enabled: true,
+            max_retries: 3,
+        });
+
+        let handler = gateway.get_handler("handler-1");
+        assert!(handler.is_some());
+
+        let handlers = gateway.list_handlers();
+        assert_eq!(handlers.len(), 1);
+
+        gateway.remove_handler("handler-1");
+        assert!(gateway.get_handler("handler-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mock_compliance_provider_screening() {
+        let provider = MockComplianceProvider::new()
+            .with_risk_score("bc1q_risky_address", 0.95)
+            .with_risk_score("bc1q_safe_address", 0.1);
+
+        let risky = provider.screen_address("bc1q_risky_address").await.unwrap();
+        assert!(risky.risk_score > 0.7);
+        assert_eq!(risky.risk_category, Some("high_risk".into()));
+
+        let safe = provider.screen_address("bc1q_safe_address").await.unwrap();
+        assert!(safe.risk_score < 0.3);
+        assert_eq!(safe.risk_category, Some("low_risk".into()));
+
+        let unknown = provider.screen_address("bc1q_unknown").await.unwrap();
+        assert!(unknown.risk_score < 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_mock_enclave_client_operations() {
+        let client = MockEnclaveClient::new();
+
+        let tx = TransactionRequest::new("wallet-1".into(), "bc1q_destination".into(), 1_000_000);
+
+        let result = client
+            .evaluate(EvaluationRequest {
+                transaction: tx,
+                policy_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.decision, EnclaveDecision::Allow);
+        assert!(!result.policy_version.is_empty());
+
+        let attestation = client.verify_attestation().await.unwrap();
+        assert!(!attestation.enclave_pubkey.is_empty());
+    }
+
+    #[test]
+    fn test_expected_pcrs_parsing() {
+        let pcr0 = "0".repeat(96);
+        let pcr1 = "1".repeat(96);
+        let pcr2 = "2".repeat(96);
+
+        let pcrs = ExpectedPcrs::from_hex(&pcr0, &pcr1, &pcr2).unwrap();
+        assert_eq!(pcrs.pcr0[0], 0x00);
+        assert_eq!(pcrs.pcr1[0], 0x11);
+        assert_eq!(pcrs.pcr2[0], 0x22);
+    }
+
+    #[test]
+    fn test_enclave_config_defaults() {
+        let config = EnclaveConfig::default();
+        assert_eq!(config.cid, 16);
+        assert_eq!(config.port, 5000);
+        assert!(config.expected_pcrs.is_none());
+        assert_eq!(config.timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_escalation_policy_stages() {
+        let policy = EscalationPolicy::default();
+
+        assert_eq!(policy.name, "default-escalation");
+        assert_eq!(policy.stages.len(), 3);
+
+        assert_eq!(policy.stages[0].stage, 1);
+        assert_eq!(policy.stages[0].duration_hours, 4);
+
+        assert_eq!(policy.stages[1].stage, 2);
+        assert_eq!(policy.stages[1].duration_hours, 8);
+
+        assert_eq!(policy.stages[2].stage, 3);
+        assert_eq!(policy.stages[2].duration_hours, 24);
+
+        match &policy.final_action {
+            FinalAction::AutoReject { reason } => {
+                assert!(reason.contains("timeout"));
+            }
+            _ => panic!("Expected AutoReject final action"),
+        }
+    }
+
+    #[test]
+    fn test_escalation_actions_serialization() {
+        let reminder = EscalationAction::Reminder {
+            channels: vec!["email".into(), "slack".into()],
+            message: "Approval pending for {transaction_id}".into(),
+        };
+        let json = serde_json::to_string(&reminder).unwrap();
+        assert!(json.contains("reminder"));
+
+        let escalate = EscalationAction::Escalate {
+            to_groups: vec!["managers".into()],
+            add_to_approvers: true,
+        };
+        let json = serde_json::to_string(&escalate).unwrap();
+        assert!(json.contains("escalate"));
+    }
+
+    #[tokio::test]
+    async fn test_escalation_policy_store() {
+        let store = InMemoryEscalationPolicyStore::new();
+
+        let policy = EscalationPolicy::default();
+        store.create(policy.clone()).await.unwrap();
+
+        let retrieved = store.get(&policy.name).await.unwrap();
+        assert_eq!(retrieved.name, policy.name);
+
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        let updated = EscalationPolicy {
+            name: policy.name.clone(),
+            stages: vec![EscalationStage {
+                stage: 1,
+                duration_hours: 2,
+                actions: vec![],
+            }],
+            final_action: FinalAction::Notify {
+                channels: vec!["slack".into()],
+                message: "Workflow expired".into(),
+            },
+        };
+        store.update(updated).await.unwrap();
+
+        let after_update = store.get(&policy.name).await.unwrap();
+        assert_eq!(after_update.stages.len(), 1);
+        assert_eq!(after_update.stages[0].duration_hours, 2);
+
+        store.delete(&policy.name).await.unwrap();
+        assert!(store.get(&policy.name).await.is_err());
+    }
+
+    struct MockWorkflowClient {
+        workflows: tokio::sync::RwLock<Vec<PendingWorkflow>>,
+    }
+
+    impl MockWorkflowClient {
+        fn new() -> Self {
+            Self {
+                workflows: tokio::sync::RwLock::new(vec![]),
+            }
+        }
+
+        async fn add_workflow(&self, workflow: PendingWorkflow) {
+            self.workflows.write().await.push(workflow);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowClient for MockWorkflowClient {
+        async fn list_pending_workflows(&self) -> warden_core::Result<Vec<PendingWorkflow>> {
+            Ok(self.workflows.read().await.clone())
+        }
+
+        async fn add_approver_groups(
+            &self,
+            _workflow_id: &str,
+            _groups: &[String],
+        ) -> warden_core::Result<()> {
+            Ok(())
+        }
+
+        async fn update_escalation_stage(
+            &self,
+            _workflow_id: &str,
+            _stage: u32,
+        ) -> warden_core::Result<()> {
+            Ok(())
+        }
+
+        async fn reject_workflow(
+            &self,
+            _workflow_id: &str,
+            _reason: &str,
+        ) -> warden_core::Result<()> {
+            Ok(())
+        }
+
+        async fn approve_workflow(
+            &self,
+            _workflow_id: &str,
+            _reason: &str,
+        ) -> warden_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_escalation_manager_initial_escalation() {
+        let policy_store = InMemoryEscalationPolicyStore::new();
+        let workflow_client = MockWorkflowClient::new();
+
+        let policy = EscalationPolicy::default();
+        policy_store.create(policy.clone()).await.unwrap();
+
+        workflow_client
+            .add_workflow(PendingWorkflow {
+                id: Uuid::new_v4().to_string(),
+                transaction_id: "tx-1".into(),
+                created_at: Utc::now(),
+                escalation_policy_id: policy.name.clone(),
+                escalation_stage: 0,
+                approvers: vec![],
+            })
+            .await;
+
+        let manager = EscalationManager::<_, _, warden_core::LoggingSender>::new(
+            policy_store,
+            workflow_client,
+        );
+
+        let results = manager.process_escalations().await.unwrap();
+        assert_eq!(results.escalated.len(), 1);
+    }
+
+    #[test]
+    fn test_bundle_manifest_sufficient_signatures() {
+        let manifest = BundleManifest {
+            version: "1.0.0".into(),
+            created_at: Utc::now(),
+            created_by: "admin@example.com".into(),
+            previous_version: None,
+            previous_root_hash: None,
+            contents: BundleContents {
+                policies: vec!["policies/main.yaml".into()],
+                whitelists: vec![],
+                blacklists: vec![],
+            },
+            merkle_root: "abc123".into(),
+            signatures: vec![
+                BundleSignature {
+                    signer: "admin-key-1".into(),
+                    algorithm: "ES256".into(),
+                    signature: "sig1".into(),
+                    signed_at: Utc::now(),
+                },
+                BundleSignature {
+                    signer: "admin-key-2".into(),
+                    algorithm: "ES256".into(),
+                    signature: "sig2".into(),
+                    signed_at: Utc::now(),
+                },
+            ],
+            required_signatures: 2,
+            valid_signers: vec![
+                "admin-key-1".into(),
+                "admin-key-2".into(),
+                "admin-key-3".into(),
+            ],
+        };
+
+        assert!(manifest.has_sufficient_signatures());
+
+        let insufficient = BundleManifest {
+            required_signatures: 3,
+            ..manifest.clone()
+        };
+        assert!(!insufficient.has_sufficient_signatures());
+    }
+
+    #[test]
+    fn test_audit_event_types_comprehensive() {
+        let events = vec![
+            AuditEventType::PolicyCreated {
+                policy_id: "p1".into(),
+                version: "1.0".into(),
+            },
+            AuditEventType::PolicyActivated {
+                policy_id: "p1".into(),
+                version: "1.0".into(),
+            },
+            AuditEventType::PolicyDeactivated {
+                policy_id: "p1".into(),
+            },
+            AuditEventType::BundleLoaded {
+                version: "1.0".into(),
+                merkle_root: "abc".into(),
+            },
+            AuditEventType::TransactionSubmitted {
+                transaction_id: "tx1".into(),
+            },
+            AuditEventType::PolicyEvaluated {
+                transaction_id: "tx1".into(),
+                decision: "allow".into(),
+                matched_rule: Some("rule1".into()),
+                evaluation_time_us: 100,
+            },
+            AuditEventType::ApprovalWorkflowStarted {
+                transaction_id: "tx1".into(),
+                workflow_id: "wf1".into(),
+            },
+            AuditEventType::ApprovalReceived {
+                transaction_id: "tx1".into(),
+                approver_id: "alice".into(),
+                decision: "approve".into(),
+            },
+            AuditEventType::ApprovalWorkflowCompleted {
+                transaction_id: "tx1".into(),
+                outcome: "approved".into(),
+            },
+            AuditEventType::CallbackInvoked {
+                transaction_id: "tx1".into(),
+                handler_id: "chainalysis".into(),
+            },
+            AuditEventType::CallbackCompleted {
+                transaction_id: "tx1".into(),
+                handler_id: "chainalysis".into(),
+                decision: "approve".into(),
+                latency_ms: 150,
+            },
+            AuditEventType::SigningInitiated {
+                transaction_id: "tx1".into(),
+                session_id: "sess1".into(),
+            },
+            AuditEventType::SigningCompleted {
+                transaction_id: "tx1".into(),
+                txid: "btc_txid".into(),
+            },
+            AuditEventType::SigningFailed {
+                transaction_id: "tx1".into(),
+                error: "timeout".into(),
+            },
+            AuditEventType::SystemStarted {
+                version: "1.0".into(),
+            },
+            AuditEventType::ConfigurationChanged {
+                key: "max_amount".into(),
+            },
+            AuditEventType::EnclaveAttestationVerified { pcr0: "abc".into() },
+            AuditEventType::EscalationTriggered {
+                transaction_id: "tx1".into(),
+                stage: 2,
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(!json.is_empty());
+            let _parsed: AuditEventType = serde_json::from_str(&json).unwrap();
+        }
     }
 }
