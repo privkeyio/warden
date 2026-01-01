@@ -42,6 +42,7 @@ nostr-sdk = { version = "0.38", default-features = false, features = ["nip59"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 indexmap = "2"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tempfile = "3.10"
 directories = "5"
 getrandom = "0.2"
