@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::callback::{CallbackDecision, CallbackRequest, CallbackResponse};
+use crate::secrets::SecretValue;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -81,18 +82,27 @@ pub trait ComplianceProvider: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainalysisConfig {
-    pub api_key: String,
+    pub api_key: SecretValue,
     pub base_url: String,
     pub timeout_seconds: u32,
 }
 
-impl Default for ChainalysisConfig {
-    fn default() -> Self {
+impl ChainalysisConfig {
+    pub fn from_env() -> Self {
         Self {
-            api_key: String::new(),
-            base_url: "https://api.chainalysis.com".into(),
+            api_key: std::env::var("CHAINALYSIS_API_KEY")
+                .unwrap_or_default()
+                .into(),
+            base_url: std::env::var("CHAINALYSIS_BASE_URL")
+                .unwrap_or_else(|_| "https://api.chainalysis.com".into()),
             timeout_seconds: 30,
         }
+    }
+}
+
+impl Default for ChainalysisConfig {
+    fn default() -> Self {
+        Self::from_env()
     }
 }
 
@@ -128,7 +138,7 @@ impl ComplianceProvider for ChainalysisClient {
         let response = self
             .http_client
             .get(&url)
-            .header("Token", &self.config.api_key)
+            .header("Token", self.config.api_key.expose())
             .timeout(std::time::Duration::from_secs(
                 self.config.timeout_seconds as u64,
             ))
@@ -220,7 +230,7 @@ impl ComplianceProvider for ChainalysisClient {
         let response = self
             .http_client
             .post(&url)
-            .header("Token", &self.config.api_key)
+            .header("Token", self.config.api_key.expose())
             .json(&request)
             .timeout(std::time::Duration::from_secs(
                 self.config.timeout_seconds as u64,
@@ -245,7 +255,7 @@ impl ComplianceProvider for ChainalysisClient {
         let response = self
             .http_client
             .get(&url)
-            .header("Token", &self.config.api_key)
+            .header("Token", self.config.api_key.expose())
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -304,20 +314,29 @@ struct RegisterTransferRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EllipticConfig {
-    pub api_key: String,
-    pub api_secret: String,
+    pub api_key: SecretValue,
+    pub api_secret: SecretValue,
     pub base_url: String,
     pub timeout_seconds: u32,
 }
 
-impl Default for EllipticConfig {
-    fn default() -> Self {
+impl EllipticConfig {
+    pub fn from_env() -> Self {
         Self {
-            api_key: String::new(),
-            api_secret: String::new(),
-            base_url: "https://api.elliptic.co".into(),
+            api_key: std::env::var("ELLIPTIC_API_KEY").unwrap_or_default().into(),
+            api_secret: std::env::var("ELLIPTIC_API_SECRET")
+                .unwrap_or_default()
+                .into(),
+            base_url: std::env::var("ELLIPTIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.elliptic.co".into()),
             timeout_seconds: 30,
         }
+    }
+}
+
+impl Default for EllipticConfig {
+    fn default() -> Self {
+        Self::from_env()
     }
 }
 
@@ -361,7 +380,7 @@ impl ComplianceProvider for EllipticClient {
         let response = self
             .http_client
             .post(&url)
-            .header("x-access-key", &self.config.api_key)
+            .header("x-access-key", self.config.api_key.expose())
             .header("x-access-timestamp", &timestamp)
             .header("x-access-sign", signature)
             .json(&request)
@@ -422,7 +441,7 @@ impl EllipticClient {
         let timestamp = chrono::Utc::now().timestamp_millis().to_string();
         let message = format!("{}{}", timestamp, body);
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.config.api_secret.as_bytes())
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.config.api_secret.expose().as_bytes())
             .unwrap_or_else(|_| {
                 Hmac::<Sha256>::new_from_slice(b"").expect("HMAC can take empty key")
             });

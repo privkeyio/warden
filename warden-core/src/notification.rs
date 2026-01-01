@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::approval::{ApprovalWorkflow, TransactionDetails};
 use crate::quorum::PendingGroupInfo;
+use crate::secrets::SecretValue;
 use crate::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,15 +447,25 @@ impl NotificationSender for LoggingSender {
 #[derive(Debug, Clone)]
 pub struct NostrConfig {
     pub relay_urls: Vec<String>,
-    pub private_key_hex: Option<String>,
+    pub private_key: Option<SecretValue>,
+}
+
+impl NostrConfig {
+    pub fn from_env() -> Self {
+        Self {
+            relay_urls: std::env::var("NOSTR_RELAY_URLS")
+                .map(|s| s.split(',').map(|r| r.trim().to_string()).collect())
+                .unwrap_or_else(|_| vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()]),
+            private_key: std::env::var("NOSTR_PRIVATE_KEY")
+                .ok()
+                .map(SecretValue::new),
+        }
+    }
 }
 
 impl Default for NostrConfig {
     fn default() -> Self {
-        Self {
-            relay_urls: vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()],
-            private_key_hex: None,
-        }
+        Self::from_env()
     }
 }
 
@@ -465,8 +476,8 @@ pub struct NostrSender {
 
 impl NostrSender {
     pub fn new(config: NostrConfig) -> Self {
-        let keys = config.private_key_hex.as_ref().and_then(|hex| {
-            nostr_sdk::SecretKey::parse(hex)
+        let keys = config.private_key.as_ref().and_then(|secret| {
+            nostr_sdk::SecretKey::parse(secret.expose())
                 .ok()
                 .map(nostr_sdk::Keys::new)
         });
@@ -590,10 +601,26 @@ impl NotificationSender for NostrSender {
 pub struct EmailConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
-    pub username: String,
-    pub password: String,
+    pub username: SecretValue,
+    pub password: SecretValue,
     pub from_address: String,
     pub from_name: String,
+}
+
+impl EmailConfig {
+    pub fn from_env() -> Option<Self> {
+        Some(Self {
+            smtp_host: std::env::var("SMTP_HOST").ok()?,
+            smtp_port: std::env::var("SMTP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(587),
+            username: std::env::var("SMTP_USERNAME").ok()?.into(),
+            password: std::env::var("SMTP_PASSWORD").ok()?.into(),
+            from_address: std::env::var("SMTP_FROM_ADDRESS").ok()?,
+            from_name: std::env::var("SMTP_FROM_NAME").unwrap_or_else(|_| "Warden".into()),
+        })
+    }
 }
 
 pub struct EmailSender {
@@ -721,7 +748,10 @@ impl NotificationSender for EmailSender {
             .body(self.format_body(notification))
             .map_err(|e| NotificationError::Permanent(format!("failed to build email: {}", e)))?;
 
-        let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
+        let creds = Credentials::new(
+            self.config.username.expose().to_string(),
+            self.config.password.expose().to_string(),
+        );
 
         let mailer: AsyncSmtpTransport<Tokio1Executor> =
             AsyncSmtpTransport::<Tokio1Executor>::relay(&self.config.smtp_host)

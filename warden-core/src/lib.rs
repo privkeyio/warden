@@ -17,6 +17,7 @@ pub mod pattern;
 pub mod policy;
 pub mod quorum;
 pub mod risk;
+pub mod secrets;
 pub mod store;
 pub mod velocity;
 pub mod workflow;
@@ -101,4 +102,9 @@ pub use escalation::{
     AlertSeverity, EscalationAction, EscalationManager, EscalationOutcome, EscalationPolicy,
     EscalationPolicyStore, EscalationResults, EscalationStage, FinalAction,
     InMemoryEscalationPolicyStore, PendingWorkflow, WorkflowClient,
+};
+pub use secrets::{
+    AwsSecretsManagerConfig, AwsSecretsManagerProvider, CompositeSecretsProvider,
+    EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
+    VaultSecretsProvider,
 };
