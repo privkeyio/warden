@@ -3,11 +3,14 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "mock")]
+use warden_core::MockSigningBackend;
 use warden_core::{
     AddressListStore, ApprovalDecision, ApprovalStore, ApproverGroup, BackendRegistry, Config,
-    GroupMember, GroupStore, InMemoryAddressListStore, InMemoryApprovalStore, InMemoryGroupStore,
-    InMemoryPolicyStore, InMemoryWorkflowStore, MockSigningBackend, Policy, PolicyEvaluator,
-    PolicyStore, RedbStorage, TimeoutChecker, TransactionRequest, WorkflowStore,
+    EnclaveClient, EnclaveConfig, EnclaveProxy, GroupMember, GroupStore, InMemoryAddressListStore,
+    InMemoryApprovalStore, InMemoryGroupStore, InMemoryPolicyStore, InMemoryWorkflowStore,
+    PcrConfig, Policy, PolicyEvaluator, PolicyStore, RedbStorage, TimeoutChecker,
+    TransactionRequest, WorkflowStore,
 };
 
 #[derive(Parser)]
@@ -70,6 +73,19 @@ enum Commands {
             help = "Require TLS for non-localhost bindings (exits if TLS not configured)"
         )]
         require_tls: bool,
+        #[arg(long, help = "Enable enclave-based signing (requires Nitro Enclave)")]
+        enable_enclave: bool,
+        #[arg(
+            long,
+            help = "Require PCR attestation verification (mandatory for production)"
+        )]
+        require_attestation: bool,
+        #[arg(long, help = "Expected PCR0 value (96 hex chars)")]
+        pcr0: Option<String>,
+        #[arg(long, help = "Expected PCR1 value (96 hex chars)")]
+        pcr1: Option<String>,
+        #[arg(long, help = "Expected PCR2 value (96 hex chars)")]
+        pcr2: Option<String>,
     },
 }
 
@@ -182,6 +198,7 @@ struct Stores {
 impl Stores {
     fn new_memory() -> Self {
         let backend_registry = Arc::new(BackendRegistry::new());
+        #[cfg(feature = "mock")]
         backend_registry.register(Arc::new(MockSigningBackend::new()));
 
         Self {
@@ -201,6 +218,7 @@ impl Stores {
         let storage = RedbStorage::open(config.db_path())?;
 
         let backend_registry = Arc::new(BackendRegistry::new());
+        #[cfg(feature = "mock")]
         backend_registry.register(Arc::new(MockSigningBackend::new()));
 
         Ok(Self {
@@ -377,6 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls_cert,
             tls_key,
             require_tls,
+            enable_enclave,
+            require_attestation,
+            pcr0,
+            pcr1,
+            pcr2,
         } => {
             let host_trimmed = host.trim();
             let is_localhost = matches!(host_trimmed, "127.0.0.1" | "localhost" | "::1" | "[::1]");
@@ -394,6 +417,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: Both --tls-cert and --tls-key must be provided together.");
                 std::process::exit(1);
             }
+
+            let enclave_client: Option<Arc<dyn EnclaveClient>> = if enable_enclave {
+                if require_attestation {
+                    let has_all_pcrs = pcr0.is_some() && pcr1.is_some() && pcr2.is_some();
+                    if !has_all_pcrs {
+                        eprintln!(
+                            "Error: --require-attestation requires valid PCR configuration.\n\
+                             Please provide --pcr0, --pcr1, and --pcr2 with valid 96-character hex values."
+                        );
+                        std::process::exit(1);
+                    }
+
+                    let pcr0_val = pcr0.as_ref().unwrap();
+                    let pcr1_val = pcr1.as_ref().unwrap();
+                    let pcr2_val = pcr2.as_ref().unwrap();
+
+                    for (name, val) in [("pcr0", pcr0_val), ("pcr1", pcr1_val), ("pcr2", pcr2_val)]
+                    {
+                        if val.len() != 96 || !val.chars().all(|c| c.is_ascii_hexdigit()) {
+                            eprintln!(
+                                "Error: --{} must be exactly 96 hexadecimal characters (48 bytes). Got {} characters.",
+                                name,
+                                val.len()
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+
+                    let enclave_config = EnclaveConfig {
+                        expected_pcrs: Some(PcrConfig {
+                            pcr0: pcr0_val.clone(),
+                            pcr1: pcr1_val.clone(),
+                            pcr2: pcr2_val.clone(),
+                        }),
+                        ..EnclaveConfig::default()
+                    };
+
+                    let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
+                        eprintln!("Error: Failed to initialize enclave: {}", e);
+                        std::process::exit(1);
+                    });
+
+                    tracing::info!("Enclave enabled with PCR attestation verification");
+                    Some(Arc::new(proxy) as Arc<dyn EnclaveClient>)
+                } else {
+                    tracing::warn!(
+                        "Enclave enabled WITHOUT attestation verification - this is insecure for production use"
+                    );
+                    let enclave_config = EnclaveConfig::default();
+                    let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
+                        eprintln!("Error: Failed to initialize enclave: {}", e);
+                        std::process::exit(1);
+                    });
+                    Some(Arc::new(proxy) as Arc<dyn EnclaveClient>)
+                }
+            } else {
+                None
+            };
 
             let timeout_checker = Arc::new(TimeoutChecker::new(Arc::clone(&stores.workflow_store)));
             let timeout_handle = Arc::clone(&timeout_checker).spawn();
@@ -451,6 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stores.workflow_store,
                 stores.group_store,
                 stores.backend_registry,
+                enclave_client,
                 auth_state,
             );
             let app = warden_api::create_router(state);
