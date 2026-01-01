@@ -41,7 +41,7 @@ reqwest = { version = "0.12.8", features = ["json"] }
 nostr-sdk = { version = "0.38", default-features = false, features = ["nip59"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 indexmap = "2"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower = { version = "0.5.2", features = ["util"] }
 jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
