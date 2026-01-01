@@ -455,10 +455,10 @@ impl NostrConfig {
         Self {
             relay_urls: std::env::var("NOSTR_RELAY_URLS")
                 .map(|s| s.split(',').map(|r| r.trim().to_string()).collect())
-                .unwrap_or_else(|_| {
-                    vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()]
-                }),
-            private_key: std::env::var("NOSTR_PRIVATE_KEY").ok().map(SecretValue::new),
+                .unwrap_or_else(|_| vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()]),
+            private_key: std::env::var("NOSTR_PRIVATE_KEY")
+                .ok()
+                .map(SecretValue::new),
         }
     }
 }

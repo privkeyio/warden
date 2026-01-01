@@ -72,12 +72,22 @@ impl<'de> Deserialize<'de> for SecretValue {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretRef {
-    Env { name: String },
-    Vault { path: String, key: String },
-    AwsSecretsManager { secret_id: String, key: Option<String> },
+    Env {
+        name: String,
+    },
+    Vault {
+        path: String,
+        key: String,
+    },
+    AwsSecretsManager {
+        secret_id: String,
+        key: Option<String>,
+    },
     /// Inline literal secret value. Use only for testing/development.
     /// Warning: The value will be serialized to config files in plain text.
-    Literal { value: String },
+    Literal {
+        value: String,
+    },
 }
 
 impl std::fmt::Debug for SecretRef {
@@ -183,7 +193,9 @@ pub struct VaultSecretsProvider {
 impl VaultSecretsProvider {
     pub fn new(config: VaultConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds as u64))
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
             .build()
             .unwrap_or_default();
         Self { config, client }
@@ -228,10 +240,9 @@ impl SecretsProvider for VaultSecretsProvider {
                     .and_then(|d| d.get("data").or(Some(d)))
                     .ok_or_else(|| SecretsError::Provider("invalid Vault response".into()))?;
 
-                let value = data
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| SecretsError::NotFound(format!("key {} in path {}", key, path)))?;
+                let value = data.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                    SecretsError::NotFound(format!("key {} in path {}", key, path))
+                })?;
 
                 Ok(SecretValue::new(value))
             }
@@ -279,7 +290,9 @@ pub struct AwsSecretsManagerProvider {
 impl AwsSecretsManagerProvider {
     pub fn new(config: AwsSecretsManagerConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds as u64))
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
             .build()
             .unwrap_or_default();
         Self { config, client }
