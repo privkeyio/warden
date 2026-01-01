@@ -50,6 +50,7 @@ tempfile = "3.10"
 directories = "5"
 getrandom = "0.2"
 secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 [profile.release]
 lto = true
