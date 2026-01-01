@@ -70,9 +70,9 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health_check))
         .merge(api_router)
-        .layer(cors)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TraceLayer::new_for_http())
+        .layer(cors)
         .with_state(state)
 }
 
