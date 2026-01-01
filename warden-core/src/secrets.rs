@@ -280,8 +280,10 @@ impl AwsSecretsManagerConfig {
 
 /// AWS Secrets Manager provider for retrieving secrets.
 ///
-/// Requires AWS credentials in the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-/// or via instance metadata/IAM role when running on AWS infrastructure.
+/// **WARNING**: This provider is not yet functional. AWS API requests require Sigv4
+/// signing which is not implemented. See: https://github.com/privkeyio/warden/issues/21
+///
+/// TODO: Replace with aws-sdk-secretsmanager from https://github.com/awslabs/aws-sdk-rust
 pub struct AwsSecretsManagerProvider {
     config: AwsSecretsManagerConfig,
     client: reqwest::Client,
