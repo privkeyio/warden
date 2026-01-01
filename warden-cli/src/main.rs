@@ -418,7 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
                         .await?;
 
-                axum_server::bind_rustls(addr.parse()?, tls_config)
+                axum_server::bind_rustls(addr.parse::<std::net::SocketAddr>()?, tls_config)
                     .serve(app.into_make_service())
                     .await
             } else {
