@@ -45,7 +45,7 @@ pub use notification::{
     ApprovalProgressNotification, ApprovalRequestNotification, ApprovalSummary, EmailConfig,
     EmailSender, InMemoryNotificationStore, LoggingSender, NostrConfig, NostrSender, Notification,
     NotificationError, NotificationRecord, NotificationSender, NotificationService,
-    NotificationStatus, NotificationStore, RetryPolicy, SlackConfig, SlackSender,
+    NotificationStatus, NotificationStore, RetryPolicy, SlackConfig, SlackSender, SsrfConfig,
     TimeoutNotification, WebhookSender, WorkflowCompleteNotification,
 };
 pub use pattern::{matches_pattern, validate_approver_id, validate_name};
@@ -104,7 +104,7 @@ pub use escalation::{
     InMemoryEscalationPolicyStore, PendingWorkflow, WorkflowClient,
 };
 pub use secrets::{
-    AwsSecretsManagerConfig, AwsSecretsManagerProvider, CompositeSecretsProvider,
-    EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
-    VaultSecretsProvider,
+    validate_provider_url, AwsSecretsManagerConfig, AwsSecretsManagerProvider,
+    CompositeSecretsProvider, EnvSecretsProvider, SecretRef, SecretValue, SecretsError,
+    SecretsProvider, VaultConfig, VaultSecretsProvider,
 };

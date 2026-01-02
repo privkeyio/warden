@@ -36,6 +36,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 regex = "1"
+url = "2"
 base64 = "0.22"
 reqwest = { version = "0.12.8", features = ["json"] }
 nostr-sdk = { version = "0.38", default-features = false, features = ["nip59"] }

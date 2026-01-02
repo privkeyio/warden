@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::callback::{CallbackDecision, CallbackRequest, CallbackResponse};
-use crate::secrets::SecretValue;
+use crate::secrets::{validate_provider_url, SecretValue, SecretsError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -112,7 +112,25 @@ pub struct ChainalysisClient {
 }
 
 impl ChainalysisClient {
-    pub fn new(config: ChainalysisConfig) -> Self {
+    /// Creates a new ChainalysisClient with SSRF validation.
+    ///
+    /// # Errors
+    /// Returns `SecretsError::SsrfBlocked` if the base_url fails SSRF validation
+    /// (e.g., points to localhost, private IPs, or uses non-HTTPS).
+    pub fn new(config: ChainalysisConfig) -> Result<Self, SecretsError> {
+        validate_provider_url(&config.base_url)?;
+        Ok(Self {
+            config,
+            http_client: reqwest::Client::new(),
+        })
+    }
+
+    /// Creates a new ChainalysisClient without SSRF validation.
+    ///
+    /// # Safety
+    /// Use only when the base_url is from a trusted source (e.g., hardcoded
+    /// or from a validated configuration file). Never use with user-provided URLs.
+    pub fn new_unchecked(config: ChainalysisConfig) -> Self {
         Self {
             config,
             http_client: reqwest::Client::new(),
@@ -346,7 +364,25 @@ pub struct EllipticClient {
 }
 
 impl EllipticClient {
-    pub fn new(config: EllipticConfig) -> Self {
+    /// Creates a new EllipticClient with SSRF validation.
+    ///
+    /// # Errors
+    /// Returns `SecretsError::SsrfBlocked` if the base_url fails SSRF validation
+    /// (e.g., points to localhost, private IPs, or uses non-HTTPS).
+    pub fn new(config: EllipticConfig) -> Result<Self, SecretsError> {
+        validate_provider_url(&config.base_url)?;
+        Ok(Self {
+            config,
+            http_client: reqwest::Client::new(),
+        })
+    }
+
+    /// Creates a new EllipticClient without SSRF validation.
+    ///
+    /// # Safety
+    /// Use only when the base_url is from a trusted source (e.g., hardcoded
+    /// or from a validated configuration file). Never use with user-provided URLs.
+    pub fn new_unchecked(config: EllipticConfig) -> Self {
         Self {
             config,
             http_client: reqwest::Client::new(),
