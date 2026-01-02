@@ -326,14 +326,14 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()                            // 255.255.255.255
         || ip.is_documentation()                        // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
         || ip.is_unspecified()                          // 0.0.0.0
-        || ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGNAT)
+        || ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
 }
 
 fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     ip.is_loopback()                                    // ::1
         || ip.is_unspecified()                          // ::
         || (ip.segments()[0] & 0xFE00) == 0xFC00        // fc00::/7 (ULA)
-        || (ip.segments()[0] & 0xFFC0) == 0xFE80        // fe80::/10 (link-local)
+        || (ip.segments()[0] & 0xFFC0) == 0xFE80 // fe80::/10 (link-local)
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
@@ -350,7 +350,10 @@ const BLOCKED_HOSTNAMES: &[&str] = &[
     "kubernetes.default.svc",
 ];
 
-fn validate_webhook_url(url_str: &str, config: &SsrfConfig) -> std::result::Result<(), NotificationError> {
+fn validate_webhook_url(
+    url_str: &str,
+    config: &SsrfConfig,
+) -> std::result::Result<(), NotificationError> {
     let url = Url::parse(url_str)
         .map_err(|e| NotificationError::Permanent(format!("invalid URL: {}", e)))?;
 
@@ -1228,7 +1231,8 @@ mod tests {
     #[test]
     fn test_ssrf_blocks_cloud_metadata() {
         let config = SsrfConfig::strict();
-        let result = validate_webhook_url("https://metadata.google.internal/computeMetadata", &config);
+        let result =
+            validate_webhook_url("https://metadata.google.internal/computeMetadata", &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("blocked hostname"));
     }
@@ -1288,7 +1292,9 @@ mod tests {
     #[test]
     fn test_ssrf_blocks_ipv6_ula() {
         assert!(is_private_ipv6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)));
-        assert!(is_private_ipv6(Ipv6Addr::new(0xfdff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff)));
+        assert!(is_private_ipv6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff
+        )));
     }
 
     #[test]

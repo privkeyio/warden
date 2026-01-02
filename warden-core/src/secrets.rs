@@ -660,10 +660,7 @@ mod tests {
 
     #[test]
     fn test_vault_provider_ssrf_protection() {
-        let config = VaultConfig::new(
-            "http://localhost:8200",
-            SecretValue::new("test-token"),
-        );
+        let config = VaultConfig::new("http://localhost:8200", SecretValue::new("test-token"));
         let result = VaultSecretsProvider::new(config);
         assert!(result.is_err());
         match result {
