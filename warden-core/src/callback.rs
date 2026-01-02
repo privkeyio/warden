@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::Utc;
+use nostr_sdk::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
@@ -124,10 +128,83 @@ impl CallbackError {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwsHeader {
+    pub alg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+}
+
+pub struct JwsVerifier {
+    secp: Secp256k1<nostr_sdk::secp256k1::All>,
+}
+
+impl JwsVerifier {
+    pub fn new() -> Self {
+        Self {
+            secp: Secp256k1::new(),
+        }
+    }
+
+    pub fn verify(&self, jws_token: &str, public_key_hex: &str) -> Result<String, CallbackError> {
+        let parts: Vec<&str> = jws_token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(CallbackError::InvalidSignature);
+        }
+
+        let (header_b64, payload_b64, signature_b64) = (parts[0], parts[1], parts[2]);
+
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .map_err(|_| CallbackError::InvalidSignature)?;
+
+        let header: JwsHeader =
+            serde_json::from_slice(&header_bytes).map_err(|_| CallbackError::InvalidSignature)?;
+
+        if header.alg != "ES256K-SR" {
+            return Err(CallbackError::InvalidSignature);
+        }
+
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .map_err(|_| CallbackError::InvalidSignature)?;
+
+        let signature_bytes = URL_SAFE_NO_PAD
+            .decode(signature_b64)
+            .map_err(|_| CallbackError::InvalidSignature)?;
+
+        let public_key_bytes =
+            hex::decode(public_key_hex).map_err(|_| CallbackError::InvalidSignature)?;
+
+        let public_key = XOnlyPublicKey::from_slice(&public_key_bytes)
+            .map_err(|_| CallbackError::InvalidSignature)?;
+
+        let signature =
+            Signature::from_slice(&signature_bytes).map_err(|_| CallbackError::InvalidSignature)?;
+
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let hash = Sha256::digest(signing_input.as_bytes());
+        let message = Message::from_digest(hash.into());
+
+        self.secp
+            .verify_schnorr(&signature, &message, &public_key)
+            .map_err(|_| CallbackError::InvalidSignature)?;
+
+        String::from_utf8(payload_bytes).map_err(|_| CallbackError::InvalidSignature)
+    }
+}
+
+impl Default for JwsVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct CallbackGateway {
     http_client: reqwest::Client,
     handlers: HashMap<String, CallbackHandlerConfig>,
     max_retries: u32,
+    jws_verifier: JwsVerifier,
 }
 
 impl CallbackGateway {
@@ -136,6 +213,7 @@ impl CallbackGateway {
             http_client: reqwest::Client::new(),
             handlers: HashMap::new(),
             max_retries: 3,
+            jws_verifier: JwsVerifier::new(),
         }
     }
 
@@ -253,7 +331,12 @@ impl CallbackGateway {
             .await
             .map_err(|e| CallbackError::HttpError(e.to_string()))?;
 
-        let callback_response: CallbackResponse = serde_json::from_str(&response_text)
+        let payload_json = match &handler.public_key {
+            Some(public_key) => self.jws_verifier.verify(&response_text, public_key)?,
+            None => response_text,
+        };
+
+        let callback_response: CallbackResponse = serde_json::from_str(&payload_json)
             .map_err(|e| CallbackError::SerializationError(e.to_string()))?;
 
         if callback_response.jti != expected_jti {
@@ -314,6 +397,161 @@ impl Default for CallbackRuleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::secp256k1::{Keypair, SecretKey};
+
+    fn create_test_jws(payload: &str, secret_key: &SecretKey) -> String {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, secret_key);
+
+        let header = JwsHeader {
+            alg: "ES256K-SR".into(),
+            kid: None,
+        };
+        let header_json = serde_json::to_string(&header).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let hash = Sha256::digest(signing_input.as_bytes());
+        let message = Message::from_digest(hash.into());
+        let signature = secp.sign_schnorr(&message, &keypair);
+
+        format!(
+            "{}.{}.{}",
+            header_b64,
+            payload_b64,
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    #[test]
+    fn test_jws_verify_valid_signature() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let (public_key, _) = keypair.x_only_public_key();
+        let public_key_hex = hex::encode(public_key.serialize());
+
+        let payload = r#"{"decision":"APPROVE","jti":"test-123"}"#;
+        let jws = create_test_jws(payload, &secret_key);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&jws, &public_key_hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn test_jws_verify_wrong_public_key() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let wrong_secret_key = SecretKey::from_slice(&[0x43; 32]).unwrap();
+        let wrong_keypair = Keypair::from_secret_key(&secp, &wrong_secret_key);
+        let (wrong_public_key, _) = wrong_keypair.x_only_public_key();
+        let wrong_public_key_hex = hex::encode(wrong_public_key.serialize());
+
+        let payload = r#"{"decision":"APPROVE"}"#;
+        let jws = create_test_jws(payload, &secret_key);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&jws, &wrong_public_key_hex);
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_jws_verify_tampered_payload() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let (public_key, _) = keypair.x_only_public_key();
+        let public_key_hex = hex::encode(public_key.serialize());
+
+        let payload = r#"{"decision":"APPROVE"}"#;
+        let jws = create_test_jws(payload, &secret_key);
+
+        let parts: Vec<&str> = jws.split('.').collect();
+        let tampered_payload = URL_SAFE_NO_PAD.encode(r#"{"decision":"REJECT"}"#.as_bytes());
+        let tampered_jws = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&tampered_jws, &public_key_hex);
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_jws_verify_invalid_format() {
+        let verifier = JwsVerifier::new();
+
+        let result = verifier.verify("not.a.valid.jws.token", "deadbeef");
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+
+        let result = verifier.verify("only-one-part", "deadbeef");
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+
+        // Empty parts
+        let result = verifier.verify("..", &hex::encode([0u8; 32]));
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_jws_verify_invalid_algorithm() {
+        let header = JwsHeader {
+            alg: "RS256".into(),
+            kid: None,
+        };
+        let header_json = serde_json::to_string(&header).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"test");
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+
+        let jws = format!("{}.{}.{}", header_b64, payload_b64, sig_b64);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&jws, &hex::encode([0u8; 32]));
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_jws_verify_invalid_public_key_hex() {
+        let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
+
+        let payload = r#"{"decision":"APPROVE"}"#;
+        let jws = create_test_jws(payload, &secret_key);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&jws, "not-valid-hex");
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+
+        let result = verifier.verify(&jws, "deadbeef");
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_jws_verify_tampered_header() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let (public_key, _) = keypair.x_only_public_key();
+        let public_key_hex = hex::encode(public_key.serialize());
+
+        let payload = r#"{"decision":"APPROVE"}"#;
+        let jws = create_test_jws(payload, &secret_key);
+
+        // Tamper header to claim different algorithm
+        let tampered_header = JwsHeader {
+            alg: "RS256".into(),
+            kid: None,
+        };
+        let tampered_header_b64 =
+            URL_SAFE_NO_PAD.encode(serde_json::to_string(&tampered_header).unwrap().as_bytes());
+
+        let parts: Vec<&str> = jws.split('.').collect();
+        let tampered_jws = format!("{}.{}.{}", tampered_header_b64, parts[1], parts[2]);
+
+        let verifier = JwsVerifier::new();
+        let result = verifier.verify(&tampered_jws, &public_key_hex);
+        assert!(matches!(result, Err(CallbackError::InvalidSignature)));
+    }
 
     #[test]
     fn test_callback_decision_serialization() {
@@ -332,6 +570,7 @@ mod tests {
         assert!(CallbackError::HttpError("connection failed".into()).is_retryable());
         assert!(!CallbackError::JtiMismatch.is_retryable());
         assert!(!CallbackError::InvalidAudience.is_retryable());
+        assert!(!CallbackError::InvalidSignature.is_retryable());
     }
 
     #[test]
