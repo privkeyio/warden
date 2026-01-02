@@ -3,9 +3,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use url::Url;
 use uuid::Uuid;
 
 use crate::approval::{ApprovalWorkflow, TransactionDetails};
@@ -295,9 +297,131 @@ fn notification_type_name(notification: &Notification) -> String {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SsrfConfig {
+    pub allowlist: Option<HashSet<String>>,
+    pub allow_private_ips: bool,
+}
+
+impl SsrfConfig {
+    pub fn strict() -> Self {
+        Self {
+            allowlist: None,
+            allow_private_ips: false,
+        }
+    }
+
+    pub fn with_allowlist(domains: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            allowlist: Some(domains.into_iter().map(Into::into).collect()),
+            allow_private_ips: false,
+        }
+    }
+}
+
+fn is_private_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()                                    // 127.0.0.0/8
+        || ip.is_private()                              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        || ip.is_link_local()                           // 169.254.0.0/16 (includes cloud metadata)
+        || ip.is_broadcast()                            // 255.255.255.255
+        || ip.is_documentation()                        // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        || ip.is_unspecified()                          // 0.0.0.0
+        || ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
+}
+
+fn is_private_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()                                    // ::1
+        || ip.is_unspecified()                          // ::
+        || (ip.segments()[0] & 0xFE00) == 0xFC00        // fc00::/7 (ULA)
+        || (ip.segments()[0] & 0xFFC0) == 0xFE80 // fe80::/10 (link-local)
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_ipv4(v4),
+        IpAddr::V6(v6) => is_private_ipv6(v6),
+    }
+}
+
+const BLOCKED_HOSTNAMES: &[&str] = &[
+    "localhost",
+    "metadata.google.internal",
+    "metadata.goog",
+    "kubernetes.default.svc",
+];
+
+fn validate_webhook_url(
+    url_str: &str,
+    config: &SsrfConfig,
+) -> std::result::Result<(), NotificationError> {
+    let url = Url::parse(url_str)
+        .map_err(|e| NotificationError::Permanent(format!("invalid URL: {}", e)))?;
+
+    if url.scheme() != "https" {
+        return Err(NotificationError::Permanent(
+            "webhook URL must use HTTPS".into(),
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| NotificationError::Permanent("webhook URL must have a host".into()))?;
+
+    if let Some(ref allowlist) = config.allowlist {
+        if !allowlist.contains(host) {
+            return Err(NotificationError::Permanent(format!(
+                "host '{}' not in allowlist",
+                host
+            )));
+        }
+        return Ok(());
+    }
+
+    let host_lower = host.to_lowercase();
+    for blocked in BLOCKED_HOSTNAMES {
+        if host_lower == *blocked || host_lower.ends_with(&format!(".{}", blocked)) {
+            return Err(NotificationError::Permanent(format!(
+                "blocked hostname: {}",
+                host
+            )));
+        }
+    }
+
+    if config.allow_private_ips {
+        return Ok(());
+    }
+
+    let port = url.port().unwrap_or(443);
+    let socket_addr = format!("{}:{}", host, port);
+
+    let resolved_ips: Vec<IpAddr> = socket_addr
+        .to_socket_addrs()
+        .map_err(|e| NotificationError::Permanent(format!("DNS resolution failed: {}", e)))?
+        .map(|addr| addr.ip())
+        .collect();
+
+    if resolved_ips.is_empty() {
+        return Err(NotificationError::Permanent(
+            "DNS resolution returned no addresses".into(),
+        ));
+    }
+
+    for ip in &resolved_ips {
+        if is_private_ip(*ip) {
+            return Err(NotificationError::Permanent(format!(
+                "webhook URL resolves to private/internal IP: {}",
+                ip
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub struct WebhookSender {
     client: reqwest::Client,
     default_secret: Option<String>,
+    ssrf_config: SsrfConfig,
 }
 
 impl WebhookSender {
@@ -305,11 +429,17 @@ impl WebhookSender {
         Self {
             client: reqwest::Client::new(),
             default_secret: None,
+            ssrf_config: SsrfConfig::strict(),
         }
     }
 
     pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
         self.default_secret = Some(secret.into());
+        self
+    }
+
+    pub fn with_ssrf_config(mut self, config: SsrfConfig) -> Self {
+        self.ssrf_config = config;
         self
     }
 
@@ -362,11 +492,7 @@ impl NotificationSender for WebhookSender {
     ) -> std::result::Result<(), NotificationError> {
         let (url, secret) = self.parse_recipient(recipient)?;
 
-        if !url.starts_with("https://") {
-            return Err(NotificationError::Permanent(
-                "webhook URL must use HTTPS".into(),
-            ));
-        }
+        validate_webhook_url(url, &self.ssrf_config)?;
 
         let secret = secret
             .ok_or_else(|| NotificationError::Permanent("webhook secret not configured".into()))?;
@@ -1084,5 +1210,117 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(3), Duration::from_secs(4));
         assert_eq!(policy.delay_for_attempt(4), Duration::from_secs(8));
         assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_http() {
+        let config = SsrfConfig::strict();
+        let result = validate_webhook_url("http://example.com/webhook", &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_localhost() {
+        let config = SsrfConfig::strict();
+        let result = validate_webhook_url("https://localhost/webhook", &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked hostname"));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_cloud_metadata() {
+        let config = SsrfConfig::strict();
+        let result =
+            validate_webhook_url("https://metadata.google.internal/computeMetadata", &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked hostname"));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_ip_loopback() {
+        assert!(is_private_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(127, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_ip_class_a() {
+        assert!(is_private_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(10, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_ip_class_b() {
+        assert!(is_private_ipv4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(172, 31, 255, 255)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(172, 15, 255, 255)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(172, 32, 0, 0)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_ip_class_c() {
+        assert!(is_private_ipv4(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(192, 168, 255, 255)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_link_local() {
+        assert!(is_private_ipv4(Ipv4Addr::new(169, 254, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(169, 254, 169, 254)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_cgnat() {
+        assert!(is_private_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_private_ipv4(Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(100, 128, 0, 0)));
+    }
+
+    #[test]
+    fn test_ssrf_allows_public_ip() {
+        assert!(!is_private_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_loopback() {
+        assert!(is_private_ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_ula() {
+        assert!(is_private_ipv6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(is_private_ipv6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff
+        )));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv6_link_local() {
+        assert!(is_private_ipv6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_ssrf_allowlist() {
+        let config = SsrfConfig::with_allowlist(["api.example.com", "hooks.slack.com"]);
+
+        let result = validate_webhook_url("https://api.example.com/webhook", &config);
+        assert!(result.is_ok());
+
+        let result = validate_webhook_url("https://hooks.slack.com/webhook", &config);
+        assert!(result.is_ok());
+
+        let result = validate_webhook_url("https://evil.com/webhook", &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not in allowlist"));
+    }
+
+    #[test]
+    fn test_ssrf_config_strict() {
+        let config = SsrfConfig::strict();
+        assert!(config.allowlist.is_none());
+        assert!(!config.allow_private_ips);
     }
 }

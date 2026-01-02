@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
+use url::Url;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SecretsError {
@@ -13,6 +15,92 @@ pub enum SecretsError {
     Provider(String),
     #[error("configuration error: {0}")]
     Configuration(String),
+    #[error("SSRF validation failed: {0}")]
+    SsrfBlocked(String),
+}
+
+fn is_private_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64) // CGNAT
+}
+
+fn is_private_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (ip.segments()[0] & 0xFE00) == 0xFC00 // ULA
+        || (ip.segments()[0] & 0xFFC0) == 0xFE80 // link-local
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_ipv4(v4),
+        IpAddr::V6(v6) => is_private_ipv6(v6),
+    }
+}
+
+const BLOCKED_HOSTNAMES: &[&str] = &[
+    "localhost",
+    "metadata.google.internal",
+    "metadata.goog",
+    "kubernetes.default.svc",
+];
+
+/// Validates that a URL is safe for outbound requests (SSRF protection).
+/// Requires HTTPS, blocks private IPs, and blocks known internal hostnames.
+pub fn validate_provider_url(url_str: &str) -> Result<(), SecretsError> {
+    let url = Url::parse(url_str)
+        .map_err(|e| SecretsError::Configuration(format!("invalid URL: {}", e)))?;
+
+    if url.scheme() != "https" {
+        return Err(SecretsError::SsrfBlocked(
+            "provider URL must use HTTPS".into(),
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| SecretsError::Configuration("URL must have a host".into()))?;
+
+    let host_lower = host.to_lowercase();
+    for blocked in BLOCKED_HOSTNAMES {
+        if host_lower == *blocked || host_lower.ends_with(&format!(".{}", blocked)) {
+            return Err(SecretsError::SsrfBlocked(format!(
+                "blocked hostname: {}",
+                host
+            )));
+        }
+    }
+
+    let port = url.port().unwrap_or(443);
+    let socket_addr = format!("{}:{}", host, port);
+
+    let resolved_ips: Vec<IpAddr> = socket_addr
+        .to_socket_addrs()
+        .map_err(|e| SecretsError::Configuration(format!("DNS resolution failed: {}", e)))?
+        .map(|addr| addr.ip())
+        .collect();
+
+    if resolved_ips.is_empty() {
+        return Err(SecretsError::Configuration(
+            "DNS resolution returned no addresses".into(),
+        ));
+    }
+
+    for ip in &resolved_ips {
+        if is_private_ip(*ip) {
+            return Err(SecretsError::SsrfBlocked(format!(
+                "URL resolves to private/internal IP: {}",
+                ip
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -191,7 +279,29 @@ pub struct VaultSecretsProvider {
 }
 
 impl VaultSecretsProvider {
-    pub fn new(config: VaultConfig) -> Self {
+    /// Creates a new VaultSecretsProvider with SSRF validation.
+    ///
+    /// # Errors
+    /// Returns `SecretsError::SsrfBlocked` if the Vault address fails SSRF validation
+    /// (e.g., points to localhost, private IPs, or uses non-HTTPS).
+    pub fn new(config: VaultConfig) -> Result<Self, SecretsError> {
+        validate_provider_url(&config.address)?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, client })
+    }
+
+    /// Creates a new VaultSecretsProvider without SSRF validation.
+    ///
+    /// # Safety
+    /// Use only when the Vault address is from a trusted source (e.g., hardcoded
+    /// or from a validated configuration file). Never use with user-provided URLs.
+    pub fn new_unchecked(config: VaultConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 config.timeout_seconds as u64,
@@ -290,7 +400,32 @@ pub struct AwsSecretsManagerProvider {
 }
 
 impl AwsSecretsManagerProvider {
-    pub fn new(config: AwsSecretsManagerConfig) -> Self {
+    /// Creates a new AwsSecretsManagerProvider with SSRF validation.
+    ///
+    /// If `endpoint_url` is provided, it will be validated against SSRF attacks.
+    /// The default AWS endpoint is always allowed.
+    ///
+    /// # Errors
+    /// Returns `SecretsError::SsrfBlocked` if the custom endpoint_url fails SSRF validation.
+    pub fn new(config: AwsSecretsManagerConfig) -> Result<Self, SecretsError> {
+        if let Some(ref endpoint) = config.endpoint_url {
+            validate_provider_url(endpoint)?;
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, client })
+    }
+
+    /// Creates a new AwsSecretsManagerProvider without SSRF validation.
+    ///
+    /// # Safety
+    /// Use only when the endpoint URL is from a trusted source.
+    pub fn new_unchecked(config: AwsSecretsManagerConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 config.timeout_seconds as u64,
@@ -476,5 +611,81 @@ mod tests {
         };
         let debug_str = format!("{:?}", secret_ref);
         assert!(debug_str.contains("MY_SECRET_VAR"));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_http() {
+        let result = validate_provider_url("http://vault.example.com");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), SecretsError::SsrfBlocked(_)));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_localhost() {
+        let result = validate_provider_url("https://localhost/v1/secret");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, SecretsError::SsrfBlocked(_)));
+        assert!(err.to_string().contains("blocked hostname"));
+    }
+
+    #[test]
+    fn test_ssrf_blocks_cloud_metadata() {
+        let result = validate_provider_url("https://metadata.google.internal/computeMetadata");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked hostname"));
+    }
+
+    #[test]
+    fn test_ssrf_private_ip_detection() {
+        // Test private IPv4 ranges
+        assert!(is_private_ipv4(Ipv4Addr::new(127, 0, 0, 1))); // loopback
+        assert!(is_private_ipv4(Ipv4Addr::new(10, 0, 0, 1))); // class A
+        assert!(is_private_ipv4(Ipv4Addr::new(172, 16, 0, 1))); // class B
+        assert!(is_private_ipv4(Ipv4Addr::new(192, 168, 1, 1))); // class C
+        assert!(is_private_ipv4(Ipv4Addr::new(169, 254, 169, 254))); // link-local
+        assert!(is_private_ipv4(Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
+
+        // Public IPs should not be blocked
+        assert!(!is_private_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_private_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn test_ssrf_private_ipv6_detection() {
+        assert!(is_private_ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))); // ::1
+        assert!(is_private_ipv6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))); // ULA
+        assert!(is_private_ipv6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))); // link-local
+    }
+
+    #[test]
+    fn test_vault_provider_ssrf_protection() {
+        let config = VaultConfig::new("http://localhost:8200", SecretValue::new("test-token"));
+        let result = VaultSecretsProvider::new(config);
+        assert!(result.is_err());
+        match result {
+            Err(SecretsError::SsrfBlocked(_)) => {}
+            _ => panic!("expected SsrfBlocked error"),
+        }
+    }
+
+    #[test]
+    fn test_aws_provider_ssrf_protection() {
+        let mut config = AwsSecretsManagerConfig::new("us-east-1");
+        config.endpoint_url = Some("http://localhost:4566".into()); // LocalStack-like
+        let result = AwsSecretsManagerProvider::new(config);
+        assert!(result.is_err());
+        match result {
+            Err(SecretsError::SsrfBlocked(_)) => {}
+            _ => panic!("expected SsrfBlocked error"),
+        }
+    }
+
+    #[test]
+    fn test_aws_provider_default_endpoint_allowed() {
+        let config = AwsSecretsManagerConfig::new("us-east-1");
+        // Default AWS endpoint should be allowed (no custom endpoint)
+        let result = AwsSecretsManagerProvider::new(config);
+        assert!(result.is_ok());
     }
 }
