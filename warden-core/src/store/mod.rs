@@ -12,8 +12,8 @@ use crate::Result;
 
 pub use memory::{InMemoryAddressListStore, InMemoryPolicyStore};
 pub use redb_store::{
-    RedbAddressListStore, RedbApprovalStore, RedbGroupStore, RedbPolicyStore, RedbStorage,
-    RedbWorkflowStore,
+    DbCipher, RedbAddressListStore, RedbApprovalStore, RedbGroupStore, RedbPolicyStore,
+    RedbStorage, RedbWorkflowStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
