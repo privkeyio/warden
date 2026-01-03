@@ -21,22 +21,106 @@ use crate::pattern::matches_pattern;
 use crate::policy::Policy;
 use crate::{Error, Result};
 
+/// Nonce size for ChaCha20-Poly1305 (96 bits / 12 bytes).
 const NONCE_SIZE: usize = 12;
 
+/// Authenticated encryption cipher for database at-rest encryption.
+///
+/// `DbCipher` provides ChaCha20-Poly1305 authenticated encryption for protecting
+/// sensitive data stored in the redb database. ChaCha20-Poly1305 is an AEAD
+/// (Authenticated Encryption with Associated Data) cipher that provides both
+/// confidentiality and integrity guarantees.
+///
+/// # Security Considerations
+///
+/// - **Key Material**: Keys are 256-bit (32 bytes) and should be generated from a
+///   cryptographically secure random source. Use [`Zeroizing`] wrappers when handling
+///   key material to ensure automatic zeroing on drop.
+/// - **Key Storage**: Store encryption keys separately from encrypted data (e.g., in
+///   environment variables, HSM, or a secrets manager). Never log or serialize keys.
+/// - **Key Rotation**: Implement key rotation policies for long-lived deployments.
+///   Re-encrypt data with new keys periodically.
+/// - **Nonce Handling**: Each encryption generates a unique random 96-bit nonce via
+///   `getrandom`. Nonce reuse with the same key is catastrophic—never reuse nonces.
+///
+/// # Ciphertext Format
+///
+/// Encrypted output is `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+/// The nonce is prepended to enable self-contained decryption.
+///
+/// # Example
+///
+/// ```
+/// use warden_core::store::DbCipher;
+/// use zeroize::Zeroizing;
+///
+/// // Generate or load a 32-byte key (use secure random in production)
+/// let key = Zeroizing::new([0x42u8; 32]);
+/// let cipher = DbCipher::new(&key);
+///
+/// // Encrypt
+/// let plaintext = b"sensitive data";
+/// let ciphertext = cipher.encrypt(plaintext).expect("encryption failed");
+///
+/// // Decrypt
+/// let decrypted = cipher.decrypt(&ciphertext).expect("decryption failed");
+/// assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+/// ```
+///
+/// # Testing Recommendations
+///
+/// Beyond basic round-trip tests, validate:
+/// - Wrong-key decryption returns an error (not garbage)
+/// - Truncated/corrupted ciphertext returns an error
+/// - Hex parsing errors are handled gracefully in [`from_hex`](Self::from_hex)
+/// - Nonce uniqueness across multiple encryptions
 #[derive(Clone)]
 pub struct DbCipher {
     cipher: ChaCha20Poly1305,
 }
 
 impl DbCipher {
+    /// Creates a new cipher from a 32-byte encryption key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - A 256-bit (32-byte) encryption key. Should be generated from a
+    ///   cryptographically secure random source.
+    ///
+    /// # Security
+    ///
+    /// The caller should wrap the key in [`Zeroizing`] to ensure it is zeroed
+    /// when dropped. Do not log, serialize, or persist the key alongside encrypted data.
+    ///
+    /// # Panics
+    ///
+    /// This function will not panic as the key size is enforced by the type system.
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new_from_slice(key).expect("key is 32 bytes"),
         }
     }
 
+    /// Creates a new cipher from a hex-encoded 32-byte key.
+    ///
+    /// # Arguments
+    ///
+    /// * `hex_key` - A 64-character hex string representing a 32-byte key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - The hex string contains invalid characters
+    /// - The decoded key is not exactly 32 bytes
+    ///
+    /// # Security
+    ///
+    /// The decoded key bytes are wrapped in [`Zeroizing`] and automatically
+    /// zeroed when dropped. The intermediate decode buffer is also zeroized.
     pub fn from_hex(hex_key: &str) -> Result<Self> {
-        let key_bytes = hex::decode(hex_key).map_err(|e| Error::Encryption(e.to_string()))?;
+        // Wrap decoded bytes in Zeroizing to ensure cleanup on drop
+        let key_bytes =
+            Zeroizing::new(hex::decode(hex_key).map_err(|e| Error::Encryption(e.to_string()))?);
         if key_bytes.len() != 32 {
             return Err(Error::Encryption(format!(
                 "encryption key must be 32 bytes, got {}",
@@ -45,9 +129,32 @@ impl DbCipher {
         }
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&key_bytes);
+        // key_bytes is dropped here and zeroized
         Ok(Self::new(&key))
     }
 
+    /// Encrypts plaintext using ChaCha20-Poly1305.
+    ///
+    /// Generates a unique random 96-bit nonce for each encryption and prepends
+    /// it to the ciphertext for self-contained decryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `plaintext` - The data to encrypt.
+    ///
+    /// # Returns
+    ///
+    /// A byte vector containing `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - Random nonce generation fails (system entropy exhausted)
+    /// - Encryption fails (should not happen with valid inputs)
+    ///
+    /// # Security
+    ///
+    /// Each call generates a fresh random nonce. Never reuse nonces with the same key.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         getrandom::getrandom(&mut nonce_bytes)
@@ -65,6 +172,25 @@ impl DbCipher {
         Ok(result)
     }
 
+    /// Decrypts ciphertext using ChaCha20-Poly1305.
+    ///
+    /// Extracts the nonce from the first 12 bytes and decrypts the remainder.
+    /// Verifies the authentication tag to ensure data integrity.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The encrypted data in format `nonce (12 bytes) || ciphertext || auth_tag`.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - Input is shorter than the nonce size (12 bytes)
+    /// - Authentication tag verification fails (tampered or wrong key)
+    /// - Decryption fails for any other reason
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < NONCE_SIZE {
             return Err(Error::Encryption("ciphertext too short".to_string()));
@@ -100,10 +226,38 @@ impl RedbStorage {
         Self::open_with_cipher(path, Some(cipher))
     }
 
+    /// Opens or creates a database with optional encryption.
+    ///
+    /// # Security Note
+    ///
+    /// On Unix systems, the database file is created with mode 0o600 (owner read/write only).
+    /// For maximum security in multi-threaded environments, consider setting a restrictive
+    /// umask (e.g., `umask 0o077`) before starting the process.
     fn open_with_cipher(path: impl AsRef<Path>, cipher: Option<DbCipher>) -> Result<Self> {
         let path = path.as_ref();
+
+        // On Unix, pre-create file with restrictive permissions to avoid TOCTOU race
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if !path.exists() {
+                // Create file atomically with 0o600 permissions
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| {
+                        Error::Storage(format!("failed to create database file: {}", e))
+                    })?;
+            }
+        }
+
         let db = Database::create(path).map_err(|e| Error::Storage(e.to_string()))?;
 
+        // Ensure permissions are correct (handles existing files and non-atomic fallback)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
