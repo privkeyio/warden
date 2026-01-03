@@ -141,13 +141,20 @@ mod implementation {
             }
 
             let callbacks_snapshot: Vec<_> = self.callbacks.read().iter().cloned().collect();
+            // Capture the real session ID (first 16 bytes of the 32-byte session ID as UUID)
+            let session_id_bytes: [u8; 16] = session.session_id[..16]
+                .try_into()
+                .expect("slice is exactly 16 bytes");
+            let session_id = Uuid::from_bytes(session_id_bytes);
+            let signature_copy = *signature;
+            let now = Utc::now();
             tokio::spawn(async move {
                 let signing_session = SigningSession {
-                    session_id: Uuid::new_v4(),
+                    session_id,
                     status: SessionStatus::Completed,
-                    signature: None,
-                    created_at: Utc::now(),
-                    expires_at: Utc::now() + Duration::hours(1),
+                    signature: Some(Signature::Schnorr(signature_copy)),
+                    created_at: now,
+                    expires_at: now + Duration::hours(1),
                 };
 
                 for callback in callbacks_snapshot {
