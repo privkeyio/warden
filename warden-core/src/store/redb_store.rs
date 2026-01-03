@@ -6,6 +6,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{de::DeserializeOwned, Serialize};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -20,6 +21,36 @@ use crate::group::{ApproverGroup, GroupMember, GroupStore};
 use crate::pattern::matches_pattern;
 use crate::policy::Policy;
 use crate::{Error, Result};
+
+trait ToStorageError<T> {
+    fn storage_err(self) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> ToStorageError<T> for std::result::Result<T, E> {
+    fn storage_err(self) -> Result<T> {
+        self.map_err(|e| Error::Storage(e.to_string()))
+    }
+}
+
+trait CipherOps {
+    fn cipher(&self) -> Option<&DbCipher>;
+
+    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).storage_err()?;
+        match self.cipher() {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match self.cipher() {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).storage_err()
+    }
+}
 
 /// Nonce size for ChaCha20-Poly1305 (96 bits / 12 bytes).
 const NONCE_SIZE: usize = 12;
@@ -66,14 +97,6 @@ const NONCE_SIZE: usize = 12;
 /// let decrypted = cipher.decrypt(&ciphertext).expect("decryption failed");
 /// assert_eq!(plaintext.as_slice(), decrypted.as_slice());
 /// ```
-///
-/// # Testing Recommendations
-///
-/// Beyond basic round-trip tests, validate:
-/// - Wrong-key decryption returns an error (not garbage)
-/// - Truncated/corrupted ciphertext returns an error
-/// - Hex parsing errors are handled gracefully in [`from_hex`](Self::from_hex)
-/// - Nonce uniqueness across multiple encryptions
 #[derive(Clone)]
 pub struct DbCipher {
     cipher: ChaCha20Poly1305,
@@ -111,25 +134,16 @@ impl DbCipher {
     ///
     /// Returns [`Error::Encryption`] if:
     /// - The hex string contains invalid characters
-    /// - The decoded key is not exactly 32 bytes
+    /// - The decoded key is not exactly 32 bytes (hex string not 64 chars)
     ///
     /// # Security
     ///
-    /// The decoded key bytes are wrapped in [`Zeroizing`] and automatically
-    /// zeroed when dropped. The intermediate decode buffer is also zeroized.
+    /// Key bytes are decoded directly into a [`Zeroizing`] buffer with no
+    /// intermediate allocations, ensuring all key material is zeroed on drop.
     pub fn from_hex(hex_key: &str) -> Result<Self> {
-        // Wrap decoded bytes in Zeroizing to ensure cleanup on drop
-        let key_bytes =
-            Zeroizing::new(hex::decode(hex_key).map_err(|e| Error::Encryption(e.to_string()))?);
-        if key_bytes.len() != 32 {
-            return Err(Error::Encryption(format!(
-                "encryption key must be 32 bytes, got {}",
-                key_bytes.len()
-            )));
-        }
+        // Decode directly into a pre-zeroized fixed buffer - no intermediate Vec
         let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&key_bytes);
-        // key_bytes is dropped here and zeroized
+        hex::decode_to_slice(hex_key, &mut *key).map_err(|e| Error::Encryption(e.to_string()))?;
         Ok(Self::new(&key))
     }
 
@@ -255,7 +269,7 @@ impl RedbStorage {
             }
         }
 
-        let db = Database::create(path).map_err(|e| Error::Storage(e.to_string()))?;
+        let db = Database::create(path).storage_err()?;
 
         // Ensure permissions are correct (handles existing files and non-atomic fallback)
         #[cfg(unix)]
@@ -267,22 +281,14 @@ impl RedbStorage {
         }
 
         {
-            let wtxn = db
-                .begin_write()
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(WALLET_BINDINGS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(ADDRESS_LISTS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(WORKFLOWS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(GROUPS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.open_table(APPROVALS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+            let wtxn = db.begin_write().storage_err()?;
+            wtxn.open_table(POLICIES_TABLE).storage_err()?;
+            wtxn.open_table(WALLET_BINDINGS_TABLE).storage_err()?;
+            wtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
+            wtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
+            wtxn.open_table(GROUPS_TABLE).storage_err()?;
+            wtxn.open_table(APPROVALS_TABLE).storage_err()?;
+            wtxn.commit().storage_err()?;
         }
 
         Ok(Self {
@@ -338,23 +344,13 @@ pub struct RedbPolicyStore {
     pattern_cache: RwLock<Vec<(String, Uuid)>>,
 }
 
+impl CipherOps for RedbPolicyStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
+    }
+}
+
 impl RedbPolicyStore {
-    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
-        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
-        match &self.cipher {
-            Some(cipher) => cipher.encrypt(&plaintext),
-            None => Ok(plaintext),
-        }
-    }
-
-    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let plaintext = match &self.cipher {
-            Some(cipher) => cipher.decrypt(data)?,
-            None => data.to_vec(),
-        };
-        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
-    }
-
     fn find_matching_binding(&self, wallet_id: &str) -> Option<Uuid> {
         let cache = self.pattern_cache.read().expect("lock poisoned");
         for (pattern, policy_id) in cache.iter() {
@@ -366,17 +362,12 @@ impl RedbPolicyStore {
     }
 
     fn rebuild_pattern_cache(&self) -> Result<()> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(WALLET_BINDINGS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(WALLET_BINDINGS_TABLE).storage_err()?;
 
         let mut patterns = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (pattern, id_bytes) = result.storage_err()?;
             let uuid: Uuid = self.deserialize(id_bytes.value())?;
             patterns.push((pattern.value().to_string(), uuid));
         }
@@ -390,42 +381,26 @@ impl RedbPolicyStore {
 #[async_trait]
 impl PolicyStore for RedbPolicyStore {
     async fn create(&self, policy: Policy) -> Result<Policy> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(POLICIES_TABLE).storage_err()?;
             let key = policy.id.as_bytes();
             let value = self.serialize(&policy)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(policy)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<Policy>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(POLICIES_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(POLICIES_TABLE).storage_err()?;
 
         let key = id.as_bytes();
-        match table
-            .get(key.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            Some(value) => {
-                let policy: Policy = self.deserialize(value.value())?;
-                Ok(Some(policy))
-            }
+        match table.get(key.as_slice()).storage_err()? {
+            Some(value) => Ok(Some(self.deserialize(value.value())?)),
             None => Ok(None),
         }
     }
@@ -436,19 +411,13 @@ impl PolicyStore for RedbPolicyStore {
     }
 
     async fn list(&self) -> Result<Vec<Policy>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(POLICIES_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(POLICIES_TABLE).storage_err()?;
 
         let mut policies = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let policy: Policy = self.deserialize(value.value())?;
-            policies.push(policy);
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
+            policies.push(self.deserialize(value.value())?);
         }
         Ok(policies)
     }
@@ -458,124 +427,94 @@ impl PolicyStore for RedbPolicyStore {
     }
 
     async fn delete(&self, id: &Uuid) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(POLICIES_TABLE).storage_err()?;
             let key = id.as_bytes();
-            table
-                .remove(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            table.remove(key.as_slice()).storage_err()?;
         }
         {
-            let mut bindings = wtxn
-                .open_table(WALLET_BINDINGS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut bindings = wtxn.open_table(WALLET_BINDINGS_TABLE).storage_err()?;
             let mut to_remove = Vec::new();
-            for result in bindings.iter().map_err(|e| Error::Storage(e.to_string()))? {
-                let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            for result in bindings.iter().storage_err()? {
+                let (pattern, id_bytes) = result.storage_err()?;
                 let uuid: Uuid = self.deserialize(id_bytes.value())?;
                 if &uuid == id {
                     to_remove.push(pattern.value().to_string());
                 }
             }
             for pattern in to_remove {
-                bindings
-                    .remove(pattern.as_str())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                bindings.remove(pattern.as_str()).storage_err()?;
             }
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         self.rebuild_pattern_cache()?;
         Ok(())
     }
 
     async fn activate(&self, id: &Uuid) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         let key = id.as_bytes();
 
         let (policy_bytes, wallet_patterns): (Vec<u8>, Vec<String>) = {
-            let table = wtxn
-                .open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let table = wtxn.open_table(POLICIES_TABLE).storage_err()?;
             let value = table
                 .get(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .storage_err()?
                 .ok_or_else(|| Error::NoPolicyFound(id.to_string()))?;
 
             let mut policy: Policy = self.deserialize(value.value())?;
 
-            let patterns: Vec<String> = {
-                let mut all_patterns: Vec<String> = policy
-                    .rules
-                    .iter()
-                    .filter_map(|r| r.conditions.source_wallets.clone())
-                    .flatten()
-                    .collect();
-                all_patterns.sort();
-                all_patterns.dedup();
-                if all_patterns.is_empty() {
-                    vec!["*".to_string()]
-                } else {
-                    all_patterns
-                }
+            let mut all_patterns: Vec<String> = policy
+                .rules
+                .iter()
+                .filter_map(|r| r.conditions.source_wallets.clone())
+                .flatten()
+                .collect();
+            all_patterns.sort();
+            all_patterns.dedup();
+            let patterns = if all_patterns.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                all_patterns
             };
 
             policy.is_active = true;
-            let bytes = self.serialize(&policy)?;
-            (bytes, patterns)
+            (self.serialize(&policy)?, patterns)
         };
 
         {
-            let mut table = wtxn
-                .open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(POLICIES_TABLE).storage_err()?;
             table
                 .insert(key.as_slice(), policy_bytes.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .storage_err()?;
         }
 
         {
-            let mut bindings = wtxn
-                .open_table(WALLET_BINDINGS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut bindings = wtxn.open_table(WALLET_BINDINGS_TABLE).storage_err()?;
             let id_bytes = self.serialize(id)?;
             for pattern in &wallet_patterns {
                 bindings
                     .insert(pattern.as_str(), id_bytes.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .storage_err()?;
             }
         }
 
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         self.rebuild_pattern_cache()?;
         Ok(())
     }
 
     async fn deactivate(&self, id: &Uuid) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
 
         {
-            let mut table = wtxn
-                .open_table(POLICIES_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(POLICIES_TABLE).storage_err()?;
             let key = id.as_bytes();
 
             let maybe_policy: Option<Policy> = table
                 .get(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .storage_err()?
                 .map(|value| self.deserialize(value.value()))
                 .transpose()?;
 
@@ -584,31 +523,26 @@ impl PolicyStore for RedbPolicyStore {
                 let updated = self.serialize(&policy)?;
                 table
                     .insert(key.as_slice(), updated.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .storage_err()?;
             }
         }
 
         {
-            let mut bindings = wtxn
-                .open_table(WALLET_BINDINGS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut bindings = wtxn.open_table(WALLET_BINDINGS_TABLE).storage_err()?;
             let mut to_remove = Vec::new();
-            for result in bindings.iter().map_err(|e| Error::Storage(e.to_string()))? {
-                let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
+            for result in bindings.iter().storage_err()? {
+                let (pattern, id_bytes) = result.storage_err()?;
                 let uuid: Uuid = self.deserialize(id_bytes.value())?;
                 if &uuid == id {
                     to_remove.push(pattern.value().to_string());
                 }
             }
             for pattern in to_remove {
-                bindings
-                    .remove(pattern.as_str())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                bindings.remove(pattern.as_str()).storage_err()?;
             }
         }
 
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         self.rebuild_pattern_cache()?;
         Ok(())
     }
@@ -632,102 +566,60 @@ pub struct RedbAddressListStore {
     cipher: Option<Arc<DbCipher>>,
 }
 
-impl RedbAddressListStore {
-    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
-        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
-        match &self.cipher {
-            Some(cipher) => cipher.encrypt(&plaintext),
-            None => Ok(plaintext),
-        }
-    }
-
-    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let plaintext = match &self.cipher {
-            Some(cipher) => cipher.decrypt(data)?,
-            None => data.to_vec(),
-        };
-        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+impl CipherOps for RedbAddressListStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
     }
 }
 
 #[async_trait]
 impl AddressListStore for RedbAddressListStore {
     async fn create_list(&self, name: &str) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(ADDRESS_LISTS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
-            if table
-                .get(name)
-                .map_err(|e| Error::Storage(e.to_string()))?
-                .is_none()
-            {
+            let mut table = wtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
+            if table.get(name).storage_err()?.is_none() {
                 let data = AddressListData {
                     addresses: Vec::new(),
                 };
                 let value = self.serialize(&data)?;
-                table
-                    .insert(name, value.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                table.insert(name, value.as_slice()).storage_err()?;
             }
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(())
     }
 
     async fn delete_list(&self, name: &str) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(ADDRESS_LISTS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            table
-                .remove(name)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
+            table.remove(name).storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(())
     }
 
     async fn list_names(&self) -> Result<Vec<String>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(ADDRESS_LISTS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
 
         let mut names = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (name, _) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (name, _) = result.storage_err()?;
             names.push(name.value().to_string());
         }
         Ok(names)
     }
 
     async fn add_address(&self, list_name: &str, address: &str, label: Option<&str>) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(ADDRESS_LISTS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut table = wtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
             let mut data: AddressListData = {
                 let value = table
                     .get(list_name)
-                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .storage_err()?
                     .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
                 self.deserialize(value.value())?
             };
@@ -742,78 +634,50 @@ impl AddressListStore for RedbAddressListStore {
             }
 
             let updated = self.serialize(&data)?;
-            table
-                .insert(list_name, updated.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            table.insert(list_name, updated.as_slice()).storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(())
     }
 
     async fn remove_address(&self, list_name: &str, address: &str) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(ADDRESS_LISTS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut table = wtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
             let mut data: AddressListData = {
                 let value = table
                     .get(list_name)
-                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .storage_err()?
                     .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
                 self.deserialize(value.value())?
             };
-
             data.addresses.retain(|e| e.address != address);
-
             let updated = self.serialize(&data)?;
-            table
-                .insert(list_name, updated.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            table.insert(list_name, updated.as_slice()).storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(())
     }
 
     async fn contains(&self, list_name: &str, address: &str) -> Result<bool> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(ADDRESS_LISTS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
         let value = table
             .get(list_name)
-            .map_err(|e| Error::Storage(e.to_string()))?
+            .storage_err()?
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
-
         let data: AddressListData = self.deserialize(value.value())?;
-
         Ok(data.addresses.iter().any(|e| e.address == address))
     }
 
     async fn list_addresses(&self, list_name: &str) -> Result<Vec<AddressEntry>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(ADDRESS_LISTS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(ADDRESS_LISTS_TABLE).storage_err()?;
         let value = table
             .get(list_name)
-            .map_err(|e| Error::Storage(e.to_string()))?
+            .storage_err()?
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
-
         let data: AddressListData = self.deserialize(value.value())?;
-
         Ok(data.addresses)
     }
 }
@@ -823,63 +687,35 @@ pub struct RedbWorkflowStore {
     cipher: Option<Arc<DbCipher>>,
 }
 
-impl RedbWorkflowStore {
-    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
-        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
-        match &self.cipher {
-            Some(cipher) => cipher.encrypt(&plaintext),
-            None => Ok(plaintext),
-        }
-    }
-
-    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let plaintext = match &self.cipher {
-            Some(cipher) => cipher.decrypt(data)?,
-            None => data.to_vec(),
-        };
-        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+impl CipherOps for RedbWorkflowStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
     }
 }
 
 #[async_trait]
 impl WorkflowStore for RedbWorkflowStore {
     async fn create_workflow(&self, workflow: ApprovalWorkflow) -> Result<ApprovalWorkflow> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(WORKFLOWS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
             let key = workflow.id.as_bytes();
             let value = self.serialize(&workflow)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(workflow)
     }
 
     async fn get_workflow(&self, id: &Uuid) -> Result<Option<ApprovalWorkflow>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(WORKFLOWS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
 
         let key = id.as_bytes();
-        match table
-            .get(key.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            Some(value) => {
-                let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
-                Ok(Some(workflow))
-            }
+        match table.get(key.as_slice()).storage_err()? {
+            Some(value) => Ok(Some(self.deserialize(value.value())?)),
             None => Ok(None),
         }
     }
@@ -888,16 +724,11 @@ impl WorkflowStore for RedbWorkflowStore {
         &self,
         transaction_id: &Uuid,
     ) -> Result<Option<ApprovalWorkflow>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(WORKFLOWS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
 
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
             let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.transaction_id == *transaction_id {
                 return Ok(Some(workflow));
@@ -911,17 +742,12 @@ impl WorkflowStore for RedbWorkflowStore {
     }
 
     async fn list_pending_workflows(&self) -> Result<Vec<ApprovalWorkflow>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(WORKFLOWS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
 
         let mut workflows = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
             let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.status == WorkflowStatus::Pending {
                 workflows.push(workflow);
@@ -935,17 +761,12 @@ impl WorkflowStore for RedbWorkflowStore {
         _approver_id: &str,
         groups: &[String],
     ) -> Result<Vec<ApprovalWorkflow>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(WORKFLOWS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
 
         let mut workflows = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
             let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.status == WorkflowStatus::Pending {
                 let required_groups = workflow.requirement.all_groups();
@@ -962,35 +783,27 @@ impl WorkflowStore for RedbWorkflowStore {
         workflow_id: &Uuid,
         approval: Approval,
     ) -> Result<ApprovalWorkflow> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
 
         let workflow = {
-            let mut table = wtxn
-                .open_table(WORKFLOWS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut table = wtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
             let key = workflow_id.as_bytes();
             let mut workflow: ApprovalWorkflow = table
                 .get(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .storage_err()?
                 .ok_or_else(|| Error::WorkflowNotFound(workflow_id.to_string()))
                 .map(|v| self.deserialize(v.value()))
                 .and_then(|r| r)?;
 
             workflow.add_approval(approval);
-
             let value = self.serialize(&workflow)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+                .storage_err()?;
             workflow
         };
 
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(workflow)
     }
 }
@@ -1000,63 +813,35 @@ pub struct RedbGroupStore {
     cipher: Option<Arc<DbCipher>>,
 }
 
-impl RedbGroupStore {
-    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
-        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
-        match &self.cipher {
-            Some(cipher) => cipher.encrypt(&plaintext),
-            None => Ok(plaintext),
-        }
-    }
-
-    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let plaintext = match &self.cipher {
-            Some(cipher) => cipher.decrypt(data)?,
-            None => data.to_vec(),
-        };
-        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+impl CipherOps for RedbGroupStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
     }
 }
 
 #[async_trait]
 impl GroupStore for RedbGroupStore {
     async fn create(&self, group: ApproverGroup) -> Result<ApproverGroup> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(GROUPS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(GROUPS_TABLE).storage_err()?;
             let key = group.id.as_bytes();
             let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(group)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<ApproverGroup>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(GROUPS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(GROUPS_TABLE).storage_err()?;
 
         let key = id.as_bytes();
-        match table
-            .get(key.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            Some(value) => {
-                let group: ApproverGroup = self.deserialize(value.value())?;
-                Ok(Some(group))
-            }
+        match table.get(key.as_slice()).storage_err()? {
+            Some(value) => Ok(Some(self.deserialize(value.value())?)),
             None => Ok(None),
         }
     }
@@ -1067,19 +852,13 @@ impl GroupStore for RedbGroupStore {
     }
 
     async fn list(&self) -> Result<Vec<ApproverGroup>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(GROUPS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(GROUPS_TABLE).storage_err()?;
 
         let mut groups = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let group: ApproverGroup = self.deserialize(value.value())?;
-            groups.push(group);
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
+            groups.push(self.deserialize(value.value())?);
         }
         Ok(groups)
     }
@@ -1089,38 +868,25 @@ impl GroupStore for RedbGroupStore {
     }
 
     async fn delete(&self, id: &Uuid) -> Result<()> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(GROUPS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(GROUPS_TABLE).storage_err()?;
             let key = id.as_bytes();
-            table
-                .remove(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            table.remove(key.as_slice()).storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(())
     }
 
     async fn add_member(&self, group_id: &Uuid, member: GroupMember) -> Result<ApproverGroup> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
 
         let group = {
-            let mut table = wtxn
-                .open_table(GROUPS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut table = wtxn.open_table(GROUPS_TABLE).storage_err()?;
             let key = group_id.as_bytes();
             let mut group: ApproverGroup = table
                 .get(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .storage_err()?
                 .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
                 .map(|v| self.deserialize(v.value()))
                 .and_then(|r| r)?;
@@ -1137,30 +903,23 @@ impl GroupStore for RedbGroupStore {
             let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+                .storage_err()?;
             group
         };
 
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(group)
     }
 
     async fn remove_member(&self, group_id: &Uuid, approver_id: &str) -> Result<ApproverGroup> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
 
         let group = {
-            let mut table = wtxn
-                .open_table(GROUPS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+            let mut table = wtxn.open_table(GROUPS_TABLE).storage_err()?;
             let key = group_id.as_bytes();
             let mut group: ApproverGroup = table
                 .get(key.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .storage_err()?
                 .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
                 .map(|v| self.deserialize(v.value()))
                 .and_then(|r| r)?;
@@ -1171,12 +930,11 @@ impl GroupStore for RedbGroupStore {
             let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
+                .storage_err()?;
             group
         };
 
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(group)
     }
 
@@ -1194,78 +952,45 @@ pub struct RedbApprovalStore {
     cipher: Option<Arc<DbCipher>>,
 }
 
-impl RedbApprovalStore {
-    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
-        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
-        match &self.cipher {
-            Some(cipher) => cipher.encrypt(&plaintext),
-            None => Ok(plaintext),
-        }
-    }
-
-    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let plaintext = match &self.cipher {
-            Some(cipher) => cipher.decrypt(data)?,
-            None => data.to_vec(),
-        };
-        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+impl CipherOps for RedbApprovalStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
     }
 }
 
 #[async_trait]
 impl ApprovalStore for RedbApprovalStore {
     async fn create(&self, request: ApprovalRequest) -> Result<ApprovalRequest> {
-        let wtxn = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtxn = self.db.begin_write().storage_err()?;
         {
-            let mut table = wtxn
-                .open_table(APPROVALS_TABLE)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut table = wtxn.open_table(APPROVALS_TABLE).storage_err()?;
             let key = request.id.as_bytes();
             let value = self.serialize(&request)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .storage_err()?;
         }
-        wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        wtxn.commit().storage_err()?;
         Ok(request)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<ApprovalRequest>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(APPROVALS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(APPROVALS_TABLE).storage_err()?;
 
         let key = id.as_bytes();
-        match table
-            .get(key.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?
-        {
-            Some(value) => {
-                let request: ApprovalRequest = self.deserialize(value.value())?;
-                Ok(Some(request))
-            }
+        match table.get(key.as_slice()).storage_err()? {
+            Some(value) => Ok(Some(self.deserialize(value.value())?)),
             None => Ok(None),
         }
     }
 
     async fn get_by_transaction(&self, transaction_id: &Uuid) -> Result<Option<ApprovalRequest>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(APPROVALS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(APPROVALS_TABLE).storage_err()?;
 
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
             let request: ApprovalRequest = self.deserialize(value.value())?;
             if request.transaction_id == *transaction_id {
                 return Ok(Some(request));
@@ -1279,17 +1004,12 @@ impl ApprovalStore for RedbApprovalStore {
     }
 
     async fn list_pending(&self) -> Result<Vec<ApprovalRequest>> {
-        let rtxn = self
-            .db
-            .begin_read()
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let table = rtxn
-            .open_table(APPROVALS_TABLE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(APPROVALS_TABLE).storage_err()?;
 
         let mut requests = Vec::new();
-        for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
-            let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
             let request: ApprovalRequest = self.deserialize(value.value())?;
             if request.status == ApprovalStatus::Pending {
                 requests.push(request);
