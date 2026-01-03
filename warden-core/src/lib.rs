@@ -74,9 +74,10 @@ pub use workflow::{
 };
 
 pub use audit::{
-    ActorInfo, ActorType, AuditEvent, AuditEventType, AuditLog, AuditQuery, AuditStore,
-    ChainVerification, ComplianceExporter, DateRange, EventId, InMemoryAuditStore, ResourceInfo,
-    SOC2AuditReport,
+    ActorInfo, ActorType, AuditEvent, AuditEventType, AuditLog, AuditQuery, AuditSigner,
+    AuditSignerConfig, AuditStore, ChainVerification, ComplianceExporter, DateRange, EventId,
+    InMemoryAuditStore, ResourceInfo, Rfc3161Client, Rfc3161Token, SOC2AuditReport,
+    Secp256k1AuditSigner, Signature as AuditSignature,
 };
 pub use bundle::{
     BundleContents, BundleLoader, BundleManifest, BundleProof, BundleSignature, BundleSigner,

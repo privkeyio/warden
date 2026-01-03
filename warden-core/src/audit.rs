@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result};
+use crate::secrets::SecretRef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 pub type Hash = [u8; 32];
+pub type Signature = [u8; 64];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventId(pub String);
@@ -40,6 +43,95 @@ pub struct AuditEvent {
     pub details: Value,
     pub previous_hash: Hash,
     pub hash: Hash,
+    #[serde(with = "signature_serde")]
+    pub signature: Signature,
+    #[serde(with = "hex_serde")]
+    pub signer_pubkey: [u8; 32],
+    pub rfc3161_token: Option<Rfc3161Token>,
+}
+
+mod signature_serde {
+    use super::Signature;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(sig: &Signature, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(sig))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Signature, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid signature length"))
+    }
+}
+
+mod hex_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid pubkey length"))
+    }
+}
+
+/// RFC 3161 timestamp token from a Time Stamping Authority (TSA).
+///
+/// This token proves that the associated hash existed at `timestamp`.
+/// The `token` field contains the raw ASN.1 DER-encoded TimeStampResp.
+///
+/// **Note**: The token is stored but not validated. For production use,
+/// consider verifying the TSA signature and that the token contains the
+/// expected hash. See RFC 3161 section 2.4 for validation requirements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rfc3161Token {
+    pub tsa_url: String,
+    pub timestamp: DateTime<Utc>,
+    #[serde(with = "base64_serde")]
+    pub token: Vec<u8>,
+}
+
+mod base64_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use base64::Engine;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use base64::Engine;
+        let s = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +277,9 @@ pub enum ChainVerification {
     Tampered {
         at_sequence: u64,
     },
+    InvalidSignature {
+        at_sequence: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,26 +301,259 @@ pub trait AuditStore: Send + Sync {
     async fn query(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>>;
     async fn get_latest_sequence(&self) -> Result<u64>;
     async fn get_latest_hash(&self) -> Result<Hash>;
+
+    async fn verify_append_only(&self, event: &AuditEvent) -> Result<()> {
+        let latest_seq = self.get_latest_sequence().await.unwrap_or(0);
+        if event.sequence != latest_seq + 1 {
+            return Err(Error::Audit(format!(
+                "append-only violation: expected sequence {}, got {}",
+                latest_seq + 1,
+                event.sequence
+            )));
+        }
+        if latest_seq > 0 {
+            let prev = self.get_event(latest_seq).await?;
+            if event.previous_hash != prev.hash {
+                return Err(Error::Audit(
+                    "append-only violation: previous_hash mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-pub struct AuditLog<S: AuditStore> {
+pub trait AuditSigner: Send + Sync {
+    fn sign(&self, hash: &Hash) -> Result<Signature>;
+    fn verify(&self, hash: &Hash, signature: &Signature, pubkey: &[u8; 32]) -> Result<bool>;
+    fn public_key(&self) -> [u8; 32];
+}
+
+#[derive(Clone)]
+pub struct Secp256k1AuditSigner {
+    keys: nostr_sdk::Keys,
+}
+
+impl Secp256k1AuditSigner {
+    pub fn new(secret_key: &str) -> Result<Self> {
+        let sk = nostr_sdk::SecretKey::parse(secret_key)
+            .map_err(|e| Error::Audit(format!("invalid secret key: {}", e)))?;
+        Ok(Self {
+            keys: nostr_sdk::Keys::new(sk),
+        })
+    }
+
+    pub fn generate() -> Self {
+        Self {
+            keys: nostr_sdk::Keys::generate(),
+        }
+    }
+
+    pub fn public_key_hex(&self) -> String {
+        self.keys.public_key().to_hex()
+    }
+}
+
+impl AuditSigner for Secp256k1AuditSigner {
+    fn sign(&self, hash: &Hash) -> Result<Signature> {
+        use nostr_sdk::secp256k1::{Message, Secp256k1};
+
+        let secp = Secp256k1::new();
+        let msg = Message::from_digest(*hash);
+        let keypair = self.keys.secret_key().keypair(&secp);
+        let sig = secp.sign_schnorr(&msg, &keypair);
+        Ok(*sig.as_ref())
+    }
+
+    fn verify(&self, hash: &Hash, signature: &Signature, pubkey: &[u8; 32]) -> Result<bool> {
+        use nostr_sdk::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+
+        let secp = Secp256k1::verification_only();
+        let msg = Message::from_digest(*hash);
+        let sig = schnorr::Signature::from_slice(signature)
+            .map_err(|e| Error::Audit(format!("invalid signature format: {}", e)))?;
+        let pk = XOnlyPublicKey::from_slice(pubkey)
+            .map_err(|e| Error::Audit(format!("invalid public key: {}", e)))?;
+
+        Ok(secp.verify_schnorr(&sig, &msg, &pk).is_ok())
+    }
+
+    fn public_key(&self) -> [u8; 32] {
+        use nostr_sdk::secp256k1::Secp256k1;
+
+        let secp = Secp256k1::new();
+        let keypair = self.keys.secret_key().keypair(&secp);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        xonly.serialize()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditSignerConfig {
+    pub secret_key: SecretRef,
+    pub rfc3161_tsa_url: Option<String>,
+}
+
+impl Default for AuditSignerConfig {
+    fn default() -> Self {
+        Self {
+            secret_key: SecretRef::Env {
+                name: "WARDEN_AUDIT_SIGNING_KEY".into(),
+            },
+            rfc3161_tsa_url: None,
+        }
+    }
+}
+
+impl AuditSignerConfig {
+    /// Build a signer from this configuration using the provided secrets provider.
+    pub async fn build_signer(
+        &self,
+        provider: &dyn crate::secrets::SecretsProvider,
+    ) -> Result<Secp256k1AuditSigner> {
+        let secret = provider
+            .get(&self.secret_key)
+            .await
+            .map_err(|e| Error::Audit(format!("failed to fetch signing key: {}", e)))?;
+        Secp256k1AuditSigner::new(secret.expose())
+    }
+}
+
+/// Client for RFC 3161 Time Stamping Authority (TSA) requests.
+///
+/// This client sends hash values to a TSA and receives signed timestamps
+/// that prove the hash existed at a specific time. This is useful for
+/// audit log integrity verification.
+///
+/// **Limitations**:
+/// - The response is stored but not cryptographically validated
+/// - For production, the TSA certificate chain should be verified
+/// - Consider using a trusted TSA (e.g., DigiCert, Entrust, FreeTSA)
+pub struct Rfc3161Client {
+    tsa_url: String,
+    client: reqwest::Client,
+}
+
+impl Rfc3161Client {
+    pub fn new(tsa_url: String) -> Self {
+        Self {
+            tsa_url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn timestamp(&self, hash: &Hash) -> Result<Rfc3161Token> {
+        let request_body = self.build_timestamp_request(hash);
+
+        let response = self
+            .client
+            .post(&self.tsa_url)
+            .header("Content-Type", "application/timestamp-query")
+            .body(request_body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| Error::Audit(format!("TSA request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(Error::Audit(format!(
+                "TSA returned error: {}",
+                response.status()
+            )));
+        }
+
+        let token = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Audit(format!("Failed to read TSA response: {}", e)))?;
+
+        Ok(Rfc3161Token {
+            tsa_url: self.tsa_url.clone(),
+            timestamp: Utc::now(),
+            token: token.to_vec(),
+        })
+    }
+
+    /// Build an RFC 3161 TimeStampReq in ASN.1 DER encoding.
+    ///
+    /// Structure (per RFC 3161):
+    /// ```asn1
+    /// TimeStampReq ::= SEQUENCE {
+    ///    version          INTEGER { v1(1) },
+    ///    messageImprint   MessageImprint,
+    ///    certReq          BOOLEAN DEFAULT FALSE
+    /// }
+    /// MessageImprint ::= SEQUENCE {
+    ///    hashAlgorithm    AlgorithmIdentifier,
+    ///    hashedMessage    OCTET STRING
+    /// }
+    /// AlgorithmIdentifier ::= SEQUENCE {
+    ///    algorithm        OBJECT IDENTIFIER (2.16.840.1.101.3.4.2.1 = SHA-256),
+    ///    parameters       NULL
+    /// }
+    /// ```
+    fn build_timestamp_request(&self, hash: &Hash) -> Vec<u8> {
+        let mut request = Vec::with_capacity(59);
+        // SEQUENCE (TimeStampReq), length 57
+        request.extend_from_slice(&[0x30, 0x39]);
+        // INTEGER version = 1
+        request.extend_from_slice(&[0x02, 0x01, 0x01]);
+        // SEQUENCE (MessageImprint), length 49
+        request.extend_from_slice(&[0x30, 0x31]);
+        // SEQUENCE (AlgorithmIdentifier), length 13
+        request.extend_from_slice(&[0x30, 0x0d]);
+        // OID 2.16.840.1.101.3.4.2.1 (SHA-256)
+        request.extend_from_slice(&[
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        ]);
+        // NULL parameters
+        request.extend_from_slice(&[0x05, 0x00]);
+        // OCTET STRING (hashedMessage), length 32
+        request.extend_from_slice(&[0x04, 0x20]);
+        request.extend_from_slice(hash);
+        // BOOLEAN certReq = TRUE
+        request.extend_from_slice(&[0x01, 0x01, 0xff]);
+        request
+    }
+}
+
+pub struct AuditLog<S: AuditStore, T: AuditSigner = Secp256k1AuditSigner> {
     store: S,
+    signer: Arc<T>,
     sequence: AtomicU64,
     last_hash: RwLock<Hash>,
     record_mutex: Mutex<()>,
+    tsa_client: Option<Rfc3161Client>,
 }
 
-impl<S: AuditStore> AuditLog<S> {
-    pub async fn new(store: S) -> Result<Self> {
+impl<S: AuditStore> AuditLog<S, Secp256k1AuditSigner> {
+    pub async fn new(store: S, signer: Secp256k1AuditSigner) -> Result<Self> {
+        Self::with_signer(store, signer).await
+    }
+}
+
+impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
+    pub async fn with_signer(store: S, signer: T) -> Result<Self> {
         let sequence = store.get_latest_sequence().await.unwrap_or(0);
         let last_hash = store.get_latest_hash().await.unwrap_or([0u8; 32]);
 
         Ok(Self {
             store,
+            signer: Arc::new(signer),
             sequence: AtomicU64::new(sequence),
             last_hash: RwLock::new(last_hash),
             record_mutex: Mutex::new(()),
+            tsa_client: None,
         })
+    }
+
+    pub fn with_tsa(mut self, tsa_url: String) -> Self {
+        self.tsa_client = Some(Rfc3161Client::new(tsa_url));
+        self
+    }
+
+    pub fn signer_public_key(&self) -> [u8; 32] {
+        self.signer.public_key()
     }
 
     pub async fn record(
@@ -250,10 +578,19 @@ impl<S: AuditStore> AuditLog<S> {
             details,
             previous_hash,
             hash: [0u8; 32],
+            signature: [0u8; 64],
+            signer_pubkey: self.signer.public_key(),
+            rfc3161_token: None,
         };
 
         event.hash = self.compute_hash(&event)?;
+        event.signature = self.signer.sign(&event.hash)?;
 
+        if let Some(ref tsa) = self.tsa_client {
+            event.rfc3161_token = tsa.timestamp(&event.hash).await.ok();
+        }
+
+        self.store.verify_append_only(&event).await?;
         self.store.append(&event).await?;
 
         *self.last_hash.write().await = event.hash;
@@ -304,6 +641,15 @@ impl<S: AuditStore> AuditLog<S> {
             let computed = self.compute_hash(event)?;
             if computed != event.hash {
                 return Ok(ChainVerification::Tampered {
+                    at_sequence: event.sequence,
+                });
+            }
+
+            if !self
+                .signer
+                .verify(&event.hash, &event.signature, &event.signer_pubkey)?
+            {
+                return Ok(ChainVerification::InvalidSignature {
                     at_sequence: event.sequence,
                 });
             }
@@ -494,16 +840,21 @@ impl From<ChainVerification> for ChainVerificationReport {
                 events_checked: 0,
                 last_sequence: at_sequence,
             },
+            ChainVerification::InvalidSignature { at_sequence } => Self {
+                status: format!("invalid signature at sequence {}", at_sequence),
+                events_checked: 0,
+                last_sequence: at_sequence,
+            },
         }
     }
 }
 
-pub struct ComplianceExporter<S: AuditStore> {
-    audit_log: AuditLog<S>,
+pub struct ComplianceExporter<S: AuditStore, T: AuditSigner = Secp256k1AuditSigner> {
+    audit_log: AuditLog<S, T>,
 }
 
-impl<S: AuditStore> ComplianceExporter<S> {
-    pub fn new(audit_log: AuditLog<S>) -> Self {
+impl<S: AuditStore, T: AuditSigner> ComplianceExporter<S, T> {
+    pub fn new(audit_log: AuditLog<S, T>) -> Self {
         Self { audit_log }
     }
 
@@ -581,7 +932,8 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_record_and_verify() {
         let store = InMemoryAuditStore::new();
-        let log = AuditLog::new(store).await.unwrap();
+        let signer = Secp256k1AuditSigner::generate();
+        let log = AuditLog::new(store, signer).await.unwrap();
 
         log.record(
             AuditEventType::SystemStarted {
@@ -624,7 +976,8 @@ mod tests {
     #[tokio::test]
     async fn test_audit_query() {
         let store = InMemoryAuditStore::new();
-        let log = AuditLog::new(store).await.unwrap();
+        let signer = Secp256k1AuditSigner::generate();
+        let log = AuditLog::new(store, signer).await.unwrap();
 
         log.record(
             AuditEventType::TransactionSubmitted {
@@ -657,5 +1010,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_signature_verification() {
+        let store = InMemoryAuditStore::new();
+        let signer = Secp256k1AuditSigner::generate();
+        let pubkey = signer.public_key();
+        let log = AuditLog::new(store, signer).await.unwrap();
+
+        log.record(
+            AuditEventType::SystemStarted {
+                version: "1.0.0".into(),
+            },
+            None,
+            ResourceInfo::system(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let events = log.query(&AuditQuery::default()).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].signer_pubkey, pubkey);
+        assert_ne!(events[0].signature, [0u8; 64]);
+    }
+
+    #[test]
+    fn test_signer_roundtrip() {
+        let signer = Secp256k1AuditSigner::generate();
+        let hash: Hash = [42u8; 32];
+
+        let signature = signer.sign(&hash).unwrap();
+        let pubkey = signer.public_key();
+
+        assert!(signer.verify(&hash, &signature, &pubkey).unwrap());
+
+        let wrong_hash: Hash = [0u8; 32];
+        assert!(!signer.verify(&wrong_hash, &signature, &pubkey).unwrap());
+    }
+
+    #[test]
+    fn test_signer_from_secret_key() {
+        let signer = Secp256k1AuditSigner::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let pubkey_hex = signer.public_key_hex();
+        assert!(!pubkey_hex.is_empty());
     }
 }
