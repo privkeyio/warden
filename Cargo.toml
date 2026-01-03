@@ -59,6 +59,8 @@ secrecy = { version = "0.10", features = ["serde"] }
 aws-config = "1"
 aws-sdk-secretsmanager = "1"
 parking_lot = "0.12"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [profile.release]
 lto = true

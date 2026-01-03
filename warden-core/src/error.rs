@@ -80,6 +80,9 @@ pub enum Error {
 
     #[error("audit error: {0}")]
     Audit(String),
+
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }
 
 impl From<serde_yaml::Error> for Error {

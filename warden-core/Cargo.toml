@@ -46,6 +46,8 @@ secrecy = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-secretsmanager = { workspace = true }
 parking_lot = { workspace = true }
+chacha20poly1305 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
