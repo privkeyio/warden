@@ -31,7 +31,6 @@ mod implementation {
     use tracing::{info, warn};
     use uuid::Uuid;
 
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SigningAuthorization {
         Approved,
@@ -152,7 +151,10 @@ mod implementation {
                 };
 
                 for callback in callbacks_snapshot {
-                    if let Err(e) = callback.on_signing_completed(workflow_id, &signing_session).await {
+                    if let Err(e) = callback
+                        .on_signing_completed(workflow_id, &signing_session)
+                        .await
+                    {
                         warn!(error = %e, workflow_id = %workflow_id, "Completion callback failed");
                     }
                 }
@@ -224,7 +226,6 @@ mod implementation {
         }
     }
 
-
     pub struct KeepFrostBackend<S: AuditStore + 'static = crate::audit::InMemoryAuditStore> {
         node: Arc<KfpNode>,
         threshold: u16,
@@ -284,7 +285,9 @@ mod implementation {
         ) -> Result<()> {
             let pk = nostr_sdk::PublicKey::from_hex(pubkey_hex)
                 .map_err(|e| Error::InvalidInput(format!("Invalid pubkey hex: {}", e)))?;
-            let policy = PeerPolicy::new(pk).allow_send(allow_send).allow_receive(allow_receive);
+            let policy = PeerPolicy::new(pk)
+                .allow_send(allow_send)
+                .allow_receive(allow_receive);
             self.node.set_peer_policy(policy);
             Ok(())
         }

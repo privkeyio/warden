@@ -452,9 +452,7 @@ mod tests {
     async fn test_aws_provider_returns_clear_error() {
         let config = AwsSecretsManagerConfig::new("us-east-1");
         let provider = AwsSecretsManagerProvider::new(config);
-        let result = provider
-            .get(&SecretRef::aws("my-secret", None))
-            .await;
+        let result = provider.get(&SecretRef::aws("my-secret", None)).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
