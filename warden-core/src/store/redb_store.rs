@@ -111,25 +111,16 @@ impl DbCipher {
     ///
     /// Returns [`Error::Encryption`] if:
     /// - The hex string contains invalid characters
-    /// - The decoded key is not exactly 32 bytes
+    /// - The decoded key is not exactly 32 bytes (hex string not 64 chars)
     ///
     /// # Security
     ///
-    /// The decoded key bytes are wrapped in [`Zeroizing`] and automatically
-    /// zeroed when dropped. The intermediate decode buffer is also zeroized.
+    /// Key bytes are decoded directly into a [`Zeroizing`] buffer with no
+    /// intermediate allocations, ensuring all key material is zeroed on drop.
     pub fn from_hex(hex_key: &str) -> Result<Self> {
-        // Wrap decoded bytes in Zeroizing to ensure cleanup on drop
-        let key_bytes =
-            Zeroizing::new(hex::decode(hex_key).map_err(|e| Error::Encryption(e.to_string()))?);
-        if key_bytes.len() != 32 {
-            return Err(Error::Encryption(format!(
-                "encryption key must be 32 bytes, got {}",
-                key_bytes.len()
-            )));
-        }
+        // Decode directly into a pre-zeroized fixed buffer - no intermediate Vec
         let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&key_bytes);
-        // key_bytes is dropped here and zeroized
+        hex::decode_to_slice(hex_key, &mut *key).map_err(|e| Error::Encryption(e.to_string()))?;
         Ok(Self::new(&key))
     }
 
