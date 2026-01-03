@@ -399,6 +399,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let timeout_handle = Arc::clone(&timeout_checker).spawn();
             tracing::info!("Started workflow timeout checker");
 
+            let jwt_secret = match std::env::var("WARDEN_JWT_SECRET") {
+                Ok(secret) if secret.len() >= 32 => secret,
+                Ok(secret) => {
+                    eprintln!("Error: WARDEN_JWT_SECRET must be at least 32 characters");
+                    eprintln!("       Current length: {} characters", secret.len());
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    if std::env::var("WARDEN_INSECURE_DEV").is_ok() {
+                        eprintln!("╔══════════════════════════════════════════════════════════╗");
+                        eprintln!("║  WARNING: Running with INSECURE default JWT secret!      ║");
+                        eprintln!("║  DO NOT USE IN PRODUCTION. Set WARDEN_JWT_SECRET.        ║");
+                        eprintln!("╚══════════════════════════════════════════════════════════╝");
+                        "insecure-default-secret-for-development-only!!".to_string()
+                    } else {
+                        eprintln!("Error: WARDEN_JWT_SECRET environment variable is required");
+                        eprintln!("       Set a secret of at least 32 characters");
+                        eprintln!("       For development only, set WARDEN_INSECURE_DEV=1");
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let rate_limit = std::env::var("WARDEN_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100);
+
+            let auth_state = warden_api::AuthState::new(jwt_secret.as_bytes(), rate_limit);
+
             let state = warden_api::AppState::new(
                 stores.policy_store,
                 stores.whitelist_store,
@@ -408,7 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stores.group_store,
                 stores.backend_registry,
             );
-            let app = warden_api::create_router(state);
+            let app = warden_api::create_router(state, auth_state);
             let addr = if host_trimmed.starts_with('[') && host_trimmed.ends_with(']') {
                 format!("{}:{}", host_trimmed, port)
             } else if host_trimmed.contains(':') {
@@ -420,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
                 println!("Starting Warden API server on https://{}", addr);
                 println!("Data directory: {}", config.data_dir.display());
+                println!("Rate limit: {} requests/second", rate_limit);
 
                 let tls_config =
                     axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
@@ -444,10 +474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("Starting Warden API server on http://{}", addr);
                 println!("Data directory: {}", config.data_dir.display());
+                println!("Rate limit: {} requests/second", rate_limit);
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 axum::serve(listener, app).await
             };
-
             timeout_handle.abort();
             result?;
         }
