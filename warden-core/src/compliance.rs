@@ -345,12 +345,21 @@ pub struct EllipticClient {
     http_client: reqwest::Client,
 }
 
+const HMAC_MIN_KEY_LENGTH: usize = 32;
+
 impl EllipticClient {
-    pub fn new(config: EllipticConfig) -> Self {
-        Self {
+    pub fn new(config: EllipticConfig) -> std::result::Result<Self, ComplianceError> {
+        let key_len = config.api_secret.expose().len();
+        if key_len < HMAC_MIN_KEY_LENGTH {
+            return Err(ComplianceError::ConfigurationError(format!(
+                "HMAC key must be at least {} bytes, got {}",
+                HMAC_MIN_KEY_LENGTH, key_len
+            )));
+        }
+        Ok(Self {
             config,
             http_client: reqwest::Client::new(),
-        }
+        })
     }
 }
 
@@ -376,7 +385,7 @@ impl ComplianceProvider for EllipticClient {
             "type": "wallet_exposure"
         });
 
-        let (timestamp, signature) = self.sign_request(&request);
+        let (timestamp, signature) = self.sign_request(&request)?;
         let response = self
             .http_client
             .post(&url)
@@ -433,7 +442,10 @@ impl ComplianceProvider for EllipticClient {
 }
 
 impl EllipticClient {
-    fn sign_request(&self, request: &serde_json::Value) -> (String, String) {
+    fn sign_request(
+        &self,
+        request: &serde_json::Value,
+    ) -> std::result::Result<(String, String), ComplianceError> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
@@ -442,13 +454,11 @@ impl EllipticClient {
         let message = format!("{}{}", timestamp, body);
 
         let mut mac = Hmac::<Sha256>::new_from_slice(self.config.api_secret.expose().as_bytes())
-            .unwrap_or_else(|_| {
-                Hmac::<Sha256>::new_from_slice(b"").expect("HMAC can take empty key")
-            });
+            .map_err(|_| ComplianceError::ConfigurationError("Invalid HMAC key".into()))?;
         mac.update(message.as_bytes());
         let result = mac.finalize();
 
-        (timestamp, hex::encode(result.into_bytes()))
+        Ok((timestamp, hex::encode(result.into_bytes())))
     }
 }
 
@@ -633,5 +643,33 @@ mod tests {
         let high = AlertSeverity::High;
         let json = serde_json::to_string(&high).unwrap();
         assert_eq!(json, "\"high\"");
+    }
+
+    #[test]
+    fn test_elliptic_client_rejects_short_hmac_key() {
+        let config = EllipticConfig {
+            api_key: "test-key".to_string().into(),
+            api_secret: "short".to_string().into(),
+            base_url: "https://api.elliptic.co".into(),
+            timeout_seconds: 30,
+        };
+        let result = EllipticClient::new(config);
+        assert!(matches!(
+            result,
+            Err(ComplianceError::ConfigurationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_elliptic_client_accepts_valid_hmac_key() {
+        let valid_key = "a".repeat(HMAC_MIN_KEY_LENGTH);
+        let config = EllipticConfig {
+            api_key: "test-key".to_string().into(),
+            api_secret: valid_key.into(),
+            base_url: "https://api.elliptic.co".into(),
+            timeout_seconds: 30,
+        };
+        let result = EllipticClient::new(config);
+        assert!(result.is_ok());
     }
 }
