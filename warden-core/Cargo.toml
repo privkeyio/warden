@@ -37,6 +37,8 @@ directories = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 secrecy = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
