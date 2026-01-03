@@ -285,7 +285,11 @@ impl AwsSecretsManagerConfig {
 ///
 /// TODO: Replace with aws-sdk-secretsmanager from https://github.com/awslabs/aws-sdk-rust
 pub struct AwsSecretsManagerProvider {
+    // These fields are currently unused since Sigv4 signing is not implemented.
+    // They are retained for when the provider is implemented.
+    #[allow(dead_code)]
     config: AwsSecretsManagerConfig,
+    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
@@ -300,6 +304,9 @@ impl AwsSecretsManagerProvider {
         Self { config, client }
     }
 
+    // This method is currently unused since Sigv4 signing is not implemented.
+    // It is retained for when the provider is implemented.
+    #[allow(dead_code)]
     fn get_endpoint(&self) -> String {
         self.config.endpoint_url.clone().unwrap_or_else(|| {
             format!(
@@ -314,53 +321,16 @@ impl AwsSecretsManagerProvider {
 impl SecretsProvider for AwsSecretsManagerProvider {
     async fn get(&self, reference: &SecretRef) -> Result<SecretValue, SecretsError> {
         match reference {
-            SecretRef::AwsSecretsManager { secret_id, key } => {
-                let endpoint = self.get_endpoint();
-
-                let request_body = serde_json::json!({
-                    "SecretId": secret_id
-                });
-
-                let response = self
-                    .client
-                    .post(&endpoint)
-                    .header("Content-Type", "application/x-amz-json-1.1")
-                    .header("X-Amz-Target", "secretsmanager.GetSecretValue")
-                    .json(&request_body)
-                    .send()
-                    .await
-                    .map_err(|e| SecretsError::Provider(e.to_string()))?;
-
-                if !response.status().is_success() {
-                    return Err(SecretsError::Provider(format!(
-                        "AWS Secrets Manager returned {}",
-                        response.status()
-                    )));
-                }
-
-                let body: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| SecretsError::Provider(e.to_string()))?;
-
-                let secret_string = body
-                    .get("SecretString")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| SecretsError::Provider("no SecretString in response".into()))?;
-
-                if let Some(key) = key {
-                    let parsed: serde_json::Value = serde_json::from_str(secret_string)
-                        .map_err(|e| SecretsError::Provider(e.to_string()))?;
-
-                    let value = parsed
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| SecretsError::NotFound(format!("key {} in secret", key)))?;
-
-                    Ok(SecretValue::new(value))
-                } else {
-                    Ok(SecretValue::new(secret_string))
-                }
+            SecretRef::AwsSecretsManager { .. } => {
+                // Fail fast with a clear error message.
+                // AWS API requests require Sigv4 signing which is not yet implemented.
+                // See: https://github.com/privkeyio/warden/issues/21
+                Err(SecretsError::Configuration(
+                    "AwsSecretsManagerProvider is not yet functional: AWS API requires Sigv4 \
+                     signing which is not implemented. Use EnvSecretsProvider or \
+                     VaultSecretsProvider instead, or contribute the Sigv4 implementation."
+                        .into(),
+                ))
             }
             SecretRef::Env { .. } => EnvSecretsProvider.get(reference).await,
             SecretRef::Literal { value } => Ok(SecretValue::new(value.clone())),
@@ -476,5 +446,22 @@ mod tests {
         };
         let debug_str = format!("{:?}", secret_ref);
         assert!(debug_str.contains("MY_SECRET_VAR"));
+    }
+
+    #[tokio::test]
+    async fn test_aws_provider_returns_clear_error() {
+        let config = AwsSecretsManagerConfig::new("us-east-1");
+        let provider = AwsSecretsManagerProvider::new(config);
+        let result = provider.get(&SecretRef::aws("my-secret", None)).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            SecretsError::Configuration(msg) => {
+                assert!(msg.contains("Sigv4"));
+                assert!(msg.contains("not yet functional"));
+            }
+            _ => panic!("Expected Configuration error, got {:?}", err),
+        }
     }
 }
