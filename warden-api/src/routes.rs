@@ -5,21 +5,18 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 
-use crate::auth::{rate_limit_middleware, AuthState};
+use crate::auth::rate_limit_middleware;
 use crate::handlers;
 use crate::state::AppState;
 
-pub fn create_router(state: AppState, auth_state: AuthState) -> Router {
-    // API routes with rate limiting and auth
+pub fn create_router(state: AppState) -> Router {
     let api_router = Router::new()
         .nest("/v1", api_v1())
         .layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            rate_limit_middleware,
-        ))
-        .layer(axum::Extension(auth_state));
+            state.clone(),
+            rate_limit_middleware::<AppState>,
+        ));
 
-    // Health check bypasses rate limiting for monitoring
     Router::new()
         .route("/health", get(handlers::health_check))
         .merge(api_router)

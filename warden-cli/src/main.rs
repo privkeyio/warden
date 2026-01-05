@@ -408,11 +408,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(_) => {
                     if std::env::var("WARDEN_INSECURE_DEV").is_ok() {
-                        eprintln!("╔══════════════════════════════════════════════════════════╗");
-                        eprintln!("║  WARNING: Running with INSECURE default JWT secret!      ║");
-                        eprintln!("║  DO NOT USE IN PRODUCTION. Set WARDEN_JWT_SECRET.        ║");
-                        eprintln!("╚══════════════════════════════════════════════════════════╝");
-                        "insecure-default-secret-for-development-only!!".to_string()
+                        let mut random_bytes = [0u8; 32];
+                        getrandom::getrandom(&mut random_bytes)
+                            .expect("failed to generate random secret");
+                        let random_secret = hex::encode(random_bytes);
+                        tracing::warn!(
+                            "╔══════════════════════════════════════════════════════════╗"
+                        );
+                        tracing::warn!(
+                            "║  WARNING: Running with randomly generated JWT secret!    ║"
+                        );
+                        tracing::warn!(
+                            "║  Tokens will be invalidated on restart.                  ║"
+                        );
+                        tracing::warn!(
+                            "║  DO NOT USE IN PRODUCTION. Set WARDEN_JWT_SECRET.        ║"
+                        );
+                        tracing::warn!(
+                            "╚══════════════════════════════════════════════════════════╝"
+                        );
+                        random_secret
                     } else {
                         eprintln!("Error: WARDEN_JWT_SECRET environment variable is required");
                         eprintln!("       Set a secret of at least 32 characters");
@@ -436,8 +451,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stores.workflow_store,
                 stores.group_store,
                 stores.backend_registry,
+                auth_state,
             );
-            let app = warden_api::create_router(state, auth_state);
+            let app = warden_api::create_router(state);
             let addr = if host_trimmed.starts_with('[') && host_trimmed.ends_with(']') {
                 format!("{}:{}", host_trimmed, port)
             } else if host_trimmed.contains(':') {

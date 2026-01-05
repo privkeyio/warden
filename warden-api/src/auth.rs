@@ -100,6 +100,7 @@ pub enum AuthError {
     ExpiredToken,
     InsufficientPermissions,
     RateLimited,
+    InternalError,
 }
 
 impl IntoResponse for AuthError {
@@ -130,6 +131,11 @@ impl IntoResponse for AuthError {
                 "RATE_LIMITED",
                 "Too many requests",
             ),
+            AuthError::InternalError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Internal server error",
+            ),
         };
         (
             status,
@@ -147,18 +153,18 @@ pub struct AuthenticatedUser {
     pub role: Role,
 }
 
+pub trait HasAuthState {
+    fn auth_state(&self) -> &AuthState;
+}
+
 impl<S> FromRequestParts<S> for AuthenticatedUser
 where
-    S: Send + Sync,
+    S: HasAuthState + Send + Sync,
 {
     type Rejection = AuthError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let auth_state = parts
-            .extensions
-            .get::<AuthState>()
-            .cloned()
-            .ok_or(AuthError::InvalidToken)?;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_state = state.auth_state();
 
         let header = parts
             .headers
@@ -185,50 +191,65 @@ where
     }
 }
 
-/// Role ID constants for use with `AuthorizedUser<R>`.
-/// - `ROLE_ADMIN` (0): Full administrative access
-/// - `ROLE_APPROVER` (1): Can approve/reject transactions
-/// - `ROLE_VIEWER` (2): Read-only access
-pub const ROLE_ADMIN: u8 = 0;
-pub const ROLE_APPROVER: u8 = 1;
-pub const ROLE_VIEWER: u8 = 2;
-
-const fn role_from_id(id: u8) -> Role {
-    match id {
-        ROLE_ADMIN => Role::Admin,
-        ROLE_APPROVER => Role::Approver,
-        _ => Role::Viewer,
-    }
-}
-
-/// An authenticated user that has been authorized for a specific role level.
-///
-/// Use the `ROLE_*` constants for type parameter `R`:
-/// - `AuthorizedUser<ROLE_ADMIN>` - requires Admin role
-/// - `AuthorizedUser<ROLE_APPROVER>` - requires Approver or Admin role
-/// - `AuthorizedUser<ROLE_VIEWER>` - requires any authenticated user
-pub struct AuthorizedUser<const R: u8> {
+pub struct AdminUser {
     pub subject: String,
-    pub role: Role,
 }
 
-impl<S, const R: u8> FromRequestParts<S> for AuthorizedUser<R>
+impl<S> FromRequestParts<S> for AdminUser
 where
-    S: Send + Sync,
+    S: HasAuthState + Send + Sync,
 {
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let user = AuthenticatedUser::from_request_parts(parts, state).await?;
-        let required_role = role_from_id(R);
-
-        if !user.role.can_access(required_role) {
+        if !user.role.can_access(Role::Admin) {
             return Err(AuthError::InsufficientPermissions);
         }
-
-        Ok(AuthorizedUser {
+        Ok(AdminUser {
             subject: user.subject,
-            role: user.role,
+        })
+    }
+}
+
+pub struct ApproverUser {
+    pub subject: String,
+}
+
+impl<S> FromRequestParts<S> for ApproverUser
+where
+    S: HasAuthState + Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let user = AuthenticatedUser::from_request_parts(parts, state).await?;
+        if !user.role.can_access(Role::Approver) {
+            return Err(AuthError::InsufficientPermissions);
+        }
+        Ok(ApproverUser {
+            subject: user.subject,
+        })
+    }
+}
+
+pub struct ViewerUser {
+    pub subject: String,
+}
+
+impl<S> FromRequestParts<S> for ViewerUser
+where
+    S: HasAuthState + Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let user = AuthenticatedUser::from_request_parts(parts, state).await?;
+        if !user.role.can_access(Role::Viewer) {
+            return Err(AuthError::InsufficientPermissions);
+        }
+        Ok(ViewerUser {
+            subject: user.subject,
         })
     }
 }
@@ -280,12 +301,12 @@ impl AuthState {
     }
 }
 
-pub async fn rate_limit_middleware(
-    axum::extract::State(auth_state): axum::extract::State<AuthState>,
+pub async fn rate_limit_middleware<S: HasAuthState>(
+    axum::extract::State(state): axum::extract::State<S>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<Response, AuthError> {
-    auth_state.check_rate_limit()?;
+    state.auth_state().check_rate_limit()?;
     Ok(next.run(request).await)
 }
 
@@ -326,12 +347,5 @@ mod tests {
     fn test_auth_state_zero_rate_limit_does_not_panic() {
         // Should not panic with zero rate limit (uses max(1))
         let _state = AuthState::new(b"test-secret-32-chars-minimum!!!", 0);
-    }
-
-    #[test]
-    fn test_role_constants_match_role_from_id() {
-        assert_eq!(role_from_id(ROLE_ADMIN), Role::Admin);
-        assert_eq!(role_from_id(ROLE_APPROVER), Role::Approver);
-        assert_eq!(role_from_id(ROLE_VIEWER), Role::Viewer);
     }
 }
