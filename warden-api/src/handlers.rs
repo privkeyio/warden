@@ -12,7 +12,7 @@ use warden_core::{
     TransactionDetails, TransactionRequest, WorkflowStatus,
 };
 
-use crate::auth::AuthorizedUser;
+use crate::auth::{AuthorizedUser, ROLE_ADMIN, ROLE_APPROVER, ROLE_VIEWER};
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -115,7 +115,7 @@ impl From<&Policy> for PolicySummary {
 }
 
 pub async fn list_policies(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
 ) -> ApiResult<Vec<PolicySummary>> {
     let policies = state.policy_store.list().await.map_err(to_api_error)?;
@@ -129,7 +129,7 @@ pub struct CreatePolicyRequest {
 }
 
 pub async fn create_policy(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<Policy>), (StatusCode, Json<ApiError>)> {
@@ -157,7 +157,7 @@ pub async fn create_policy(
 }
 
 pub async fn get_policy(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Policy> {
@@ -179,7 +179,7 @@ pub async fn get_policy(
 }
 
 pub async fn update_policy(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<CreatePolicyRequest>,
@@ -224,7 +224,7 @@ pub async fn update_policy(
 }
 
 pub async fn delete_policy(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -233,7 +233,7 @@ pub async fn delete_policy(
 }
 
 pub async fn activate_policy(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -246,7 +246,7 @@ pub async fn activate_policy(
 }
 
 pub async fn deactivate_policy(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -259,7 +259,7 @@ pub async fn deactivate_policy(
 }
 
 pub async fn evaluate_policy(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Json(req): Json<TransactionRequest>,
 ) -> ApiResult<EvaluationResult> {
@@ -277,7 +277,7 @@ pub struct AuthorizationResult {
 }
 
 pub async fn authorize_transaction(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Json(req): Json<TransactionRequest>,
 ) -> ApiResult<AuthorizationResult> {
@@ -364,7 +364,7 @@ pub struct AddressList {
 }
 
 pub async fn list_whitelists(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
 ) -> ApiResult<Vec<String>> {
     let names = state
@@ -381,7 +381,7 @@ pub struct CreateListRequest {
 }
 
 pub async fn create_whitelist(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Json(req): Json<CreateListRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -395,7 +395,7 @@ pub async fn create_whitelist(
 }
 
 pub async fn get_whitelist(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<AddressList> {
@@ -414,7 +414,7 @@ pub struct AddAddressRequest {
 }
 
 pub async fn add_whitelist_address(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(req): Json<AddAddressRequest>,
@@ -428,7 +428,7 @@ pub async fn add_whitelist_address(
 }
 
 pub async fn remove_whitelist_address(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path((name, address)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -441,7 +441,7 @@ pub async fn remove_whitelist_address(
 }
 
 pub async fn list_blacklists(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
 ) -> ApiResult<Vec<String>> {
     let names = state
@@ -453,7 +453,7 @@ pub async fn list_blacklists(
 }
 
 pub async fn create_blacklist(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Json(req): Json<CreateListRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -467,7 +467,7 @@ pub async fn create_blacklist(
 }
 
 pub async fn get_blacklist(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<AddressList> {
@@ -480,7 +480,7 @@ pub async fn get_blacklist(
 }
 
 pub async fn add_blacklist_address(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(req): Json<AddAddressRequest>,
@@ -494,7 +494,7 @@ pub async fn add_blacklist_address(
 }
 
 pub async fn remove_blacklist_address(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path((name, address)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -573,7 +573,7 @@ pub struct ApprovalResponse {
 }
 
 pub async fn submit_approval(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(req): Json<SubmitApprovalRequest>,
@@ -582,7 +582,7 @@ pub async fn submit_approval(
 }
 
 pub async fn submit_rejection(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(req): Json<SubmitApprovalRequest>,
@@ -612,7 +612,7 @@ pub struct ApprovalRecord {
 }
 
 pub async fn get_workflow_status(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
 ) -> ApiResult<WorkflowStatusResponse> {
@@ -678,7 +678,7 @@ pub struct PendingApproval {
 }
 
 pub async fn list_pending_approvals(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Query(query): Query<PendingApprovalsQuery>,
 ) -> ApiResult<Vec<PendingApproval>> {
@@ -756,7 +756,7 @@ pub struct GroupResponse {
 }
 
 pub async fn list_groups(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
 ) -> ApiResult<Vec<GroupResponse>> {
     let groups = state.group_store.list().await.map_err(to_api_error)?;
@@ -781,7 +781,7 @@ pub struct CreateGroupRequest {
 }
 
 pub async fn create_group(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<GroupResponse>), (StatusCode, Json<ApiError>)> {
@@ -811,7 +811,7 @@ pub async fn create_group(
 }
 
 pub async fn get_group(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<warden_core::ApproverGroup> {
@@ -839,7 +839,7 @@ pub struct AddMemberRequest {
 }
 
 pub async fn add_group_member(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path(group_id): Path<Uuid>,
     Json(req): Json<AddMemberRequest>,
@@ -861,7 +861,7 @@ pub async fn add_group_member(
 }
 
 pub async fn remove_group_member(
-    _user: AuthorizedUser<0>,
+    _user: AuthorizedUser<ROLE_ADMIN>,
     State(state): State<AppState>,
     Path((group_id, approver_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
@@ -879,7 +879,7 @@ pub struct CancelWorkflowRequest {
 }
 
 pub async fn cancel_workflow(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(req): Json<CancelWorkflowRequest>,
@@ -931,7 +931,7 @@ pub async fn cancel_workflow(
 }
 
 pub async fn approve_transaction(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
     Json(req): Json<SubmitApprovalRequest>,
@@ -955,7 +955,7 @@ pub async fn approve_transaction(
 }
 
 pub async fn reject_transaction(
-    _user: AuthorizedUser<1>,
+    _user: AuthorizedUser<ROLE_APPROVER>,
     State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
     Json(req): Json<SubmitApprovalRequest>,
@@ -1205,7 +1205,7 @@ async fn submit_rejection_internal(
 }
 
 pub async fn get_transaction_approval_status(
-    _user: AuthorizedUser<2>,
+    _user: AuthorizedUser<ROLE_VIEWER>,
     State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
 ) -> ApiResult<WorkflowStatusResponse> {
