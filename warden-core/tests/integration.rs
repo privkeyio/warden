@@ -1353,7 +1353,7 @@ mod production_hardening {
         EscalationPolicy, EscalationPolicyStore, EscalationStage, EvaluationRequest, ExpectedPcrs,
         FinalAction, Hash, InMemoryAuditStore, InMemoryBundleStore, InMemoryEscalationPolicyStore,
         MerkleTree, MockBundleSigner, MockComplianceProvider, MockEnclaveClient, PendingWorkflow,
-        ResourceInfo, TransactionRequest, WorkflowClient,
+        ResourceInfo, Secp256k1AuditSigner, TransactionRequest, WorkflowClient,
     };
 
     #[test]
@@ -1417,7 +1417,8 @@ mod production_hardening {
     #[tokio::test]
     async fn test_audit_log_cryptographic_chaining() {
         let store = InMemoryAuditStore::new();
-        let log = AuditLog::new(store).await.unwrap();
+        let signer = Secp256k1AuditSigner::generate();
+        let log = AuditLog::new(store, signer).await.unwrap();
 
         log.record(
             AuditEventType::SystemStarted {
@@ -1470,7 +1471,8 @@ mod production_hardening {
     #[tokio::test]
     async fn test_audit_query_filtering() {
         let store = InMemoryAuditStore::new();
-        let log = AuditLog::new(store).await.unwrap();
+        let signer = Secp256k1AuditSigner::generate();
+        let log = AuditLog::new(store, signer).await.unwrap();
 
         log.record(
             AuditEventType::TransactionSubmitted {
@@ -1526,7 +1528,8 @@ mod production_hardening {
     #[tokio::test]
     async fn test_compliance_exporter_soc2() {
         let store = InMemoryAuditStore::new();
-        let log = AuditLog::new(store).await.unwrap();
+        let signer = Secp256k1AuditSigner::generate();
+        let log = AuditLog::new(store, signer).await.unwrap();
 
         log.record(
             AuditEventType::PolicyCreated {
