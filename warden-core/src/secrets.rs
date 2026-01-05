@@ -255,17 +255,10 @@ impl SecretsProvider for VaultSecretsProvider {
     }
 }
 
-/// Configuration for AWS Secrets Manager provider.
-///
-/// Note: This provider requires AWS credentials to be available in the environment
-/// (via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, instance metadata, or other standard
-/// AWS credential sources). The reqwest client relies on system-level AWS credential
-/// chain for authentication.
 #[derive(Debug, Clone)]
 pub struct AwsSecretsManagerConfig {
     pub region: String,
     pub endpoint_url: Option<String>,
-    pub timeout_seconds: u32,
 }
 
 impl AwsSecretsManagerConfig {
@@ -273,40 +266,29 @@ impl AwsSecretsManagerConfig {
         Self {
             region: region.into(),
             endpoint_url: None,
-            timeout_seconds: 30,
         }
     }
 }
 
-/// AWS Secrets Manager provider for retrieving secrets.
-///
-/// **WARNING**: This provider is not yet functional. AWS API requests require Sigv4
-/// signing which is not implemented. See: https://github.com/privkeyio/warden/issues/21
-///
-/// TODO: Replace with aws-sdk-secretsmanager from https://github.com/awslabs/aws-sdk-rust
 pub struct AwsSecretsManagerProvider {
-    config: AwsSecretsManagerConfig,
-    client: reqwest::Client,
+    client: aws_sdk_secretsmanager::Client,
 }
 
 impl AwsSecretsManagerProvider {
-    pub fn new(config: AwsSecretsManagerConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                config.timeout_seconds as u64,
-            ))
-            .build()
-            .unwrap_or_default();
-        Self { config, client }
+    pub async fn new(config: AwsSecretsManagerConfig) -> Self {
+        let region = aws_sdk_secretsmanager::config::Region::new(config.region);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+
+        if let Some(endpoint) = config.endpoint_url {
+            loader = loader.endpoint_url(endpoint);
+        }
+
+        let client = aws_sdk_secretsmanager::Client::new(&loader.load().await);
+        Self { client }
     }
 
-    fn get_endpoint(&self) -> String {
-        self.config.endpoint_url.clone().unwrap_or_else(|| {
-            format!(
-                "https://secretsmanager.{}.amazonaws.com",
-                self.config.region
-            )
-        })
+    pub fn from_client(client: aws_sdk_secretsmanager::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -315,37 +297,24 @@ impl SecretsProvider for AwsSecretsManagerProvider {
     async fn get(&self, reference: &SecretRef) -> Result<SecretValue, SecretsError> {
         match reference {
             SecretRef::AwsSecretsManager { secret_id, key } => {
-                let endpoint = self.get_endpoint();
-
-                let request_body = serde_json::json!({
-                    "SecretId": secret_id
-                });
-
                 let response = self
                     .client
-                    .post(&endpoint)
-                    .header("Content-Type", "application/x-amz-json-1.1")
-                    .header("X-Amz-Target", "secretsmanager.GetSecretValue")
-                    .json(&request_body)
+                    .get_secret_value()
+                    .secret_id(secret_id)
                     .send()
                     .await
-                    .map_err(|e| SecretsError::Provider(e.to_string()))?;
+                    .map_err(|e| {
+                        if e.as_service_error()
+                            .is_some_and(|se| se.is_resource_not_found_exception())
+                        {
+                            SecretsError::NotFound(format!("secret: {}", secret_id))
+                        } else {
+                            SecretsError::Provider(e.to_string())
+                        }
+                    })?;
 
-                if !response.status().is_success() {
-                    return Err(SecretsError::Provider(format!(
-                        "AWS Secrets Manager returned {}",
-                        response.status()
-                    )));
-                }
-
-                let body: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| SecretsError::Provider(e.to_string()))?;
-
-                let secret_string = body
-                    .get("SecretString")
-                    .and_then(|v| v.as_str())
+                let secret_string = response
+                    .secret_string()
                     .ok_or_else(|| SecretsError::Provider("no SecretString in response".into()))?;
 
                 if let Some(key) = key {

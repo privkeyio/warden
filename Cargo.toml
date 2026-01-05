@@ -50,6 +50,8 @@ tempfile = "3.10"
 directories = "5"
 getrandom = "0.2"
 secrecy = { version = "0.10", features = ["serde"] }
+aws-config = "1"
+aws-sdk-secretsmanager = "1"
 
 [profile.release]
 lto = true
