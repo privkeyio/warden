@@ -61,6 +61,15 @@ enum Commands {
         host: String,
         #[arg(long, default_value = "3000")]
         port: u16,
+        #[arg(long, help = "Path to TLS certificate PEM file")]
+        tls_cert: Option<PathBuf>,
+        #[arg(long, help = "Path to TLS private key PEM file")]
+        tls_key: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Require TLS for non-localhost bindings (exits if TLS not configured)"
+        )]
+        require_tls: bool,
     },
 }
 
@@ -362,7 +371,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_approval_action(action, &stores.workflow_store, &stores.group_store).await?
         }
         Commands::Group { action } => handle_group_action(action, &stores.group_store).await?,
-        Commands::Serve { host, port } => {
+        Commands::Serve {
+            host,
+            port,
+            tls_cert,
+            tls_key,
+            require_tls,
+        } => {
+            let host_trimmed = host.trim();
+            let is_localhost = matches!(host_trimmed, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+            let has_tls = tls_cert.is_some() && tls_key.is_some();
+
+            if require_tls && !has_tls && !is_localhost {
+                eprintln!(
+                    "Error: TLS is required for non-localhost bindings. \
+                     Provide --tls-cert and --tls-key, or bind to localhost."
+                );
+                std::process::exit(1);
+            }
+
+            if tls_cert.is_some() != tls_key.is_some() {
+                eprintln!("Error: Both --tls-cert and --tls-key must be provided together.");
+                std::process::exit(1);
+            }
+
             let timeout_checker = Arc::new(TimeoutChecker::new(Arc::clone(&stores.workflow_store)));
             let timeout_handle = Arc::clone(&timeout_checker).spawn();
             tracing::info!("Started workflow timeout checker");
@@ -377,11 +409,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stores.backend_registry,
             );
             let app = warden_api::create_router(state);
-            let addr = format!("{}:{}", host, port);
-            println!("Starting Warden API server on {}", addr);
-            println!("Data directory: {}", config.data_dir.display());
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
-            let result = axum::serve(listener, app).await;
+            let addr = if host_trimmed.starts_with('[') && host_trimmed.ends_with(']') {
+                format!("{}:{}", host_trimmed, port)
+            } else if host_trimmed.contains(':') {
+                format!("[{}]:{}", host_trimmed, port)
+            } else {
+                format!("{}:{}", host_trimmed, port)
+            };
+
+            let result = if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+                println!("Starting Warden API server on https://{}", addr);
+                println!("Data directory: {}", config.data_dir.display());
+
+                let tls_config =
+                    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+                        .await?;
+
+                axum_server::bind_rustls(addr.parse::<std::net::SocketAddr>()?, tls_config)
+                    .serve(app.into_make_service())
+                    .await
+            } else {
+                if !is_localhost {
+                    if host_trimmed == "0.0.0.0" {
+                        eprintln!(
+                            "Warning: Binding to 0.0.0.0 without TLS exposes the API on ALL network interfaces. \
+                             This is insecure for production. Use --require-tls to enforce TLS."
+                        );
+                    } else {
+                        eprintln!(
+                            "Warning: Running without TLS on non-localhost address. \
+                             Use --require-tls to enforce TLS."
+                        );
+                    }
+                }
+                println!("Starting Warden API server on http://{}", addr);
+                println!("Data directory: {}", config.data_dir.display());
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                axum::serve(listener, app).await
+            };
+
             timeout_handle.abort();
             result?;
         }
