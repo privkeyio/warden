@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
 use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::{AddressEntry, AddressListStore, PolicyStore};
 use crate::approval::{
@@ -16,6 +21,181 @@ use crate::pattern::matches_pattern;
 use crate::policy::Policy;
 use crate::{Error, Result};
 
+/// Nonce size for ChaCha20-Poly1305 (96 bits / 12 bytes).
+const NONCE_SIZE: usize = 12;
+
+/// Authenticated encryption cipher for database at-rest encryption.
+///
+/// `DbCipher` provides ChaCha20-Poly1305 authenticated encryption for protecting
+/// sensitive data stored in the redb database. ChaCha20-Poly1305 is an AEAD
+/// (Authenticated Encryption with Associated Data) cipher that provides both
+/// confidentiality and integrity guarantees.
+///
+/// # Security Considerations
+///
+/// - **Key Material**: Keys are 256-bit (32 bytes) and should be generated from a
+///   cryptographically secure random source. Use [`Zeroizing`] wrappers when handling
+///   key material to ensure automatic zeroing on drop.
+/// - **Key Storage**: Store encryption keys separately from encrypted data (e.g., in
+///   environment variables, HSM, or a secrets manager). Never log or serialize keys.
+/// - **Key Rotation**: Implement key rotation policies for long-lived deployments.
+///   Re-encrypt data with new keys periodically.
+/// - **Nonce Handling**: Each encryption generates a unique random 96-bit nonce via
+///   `getrandom`. Nonce reuse with the same key is catastrophic—never reuse nonces.
+///
+/// # Ciphertext Format
+///
+/// Encrypted output is `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+/// The nonce is prepended to enable self-contained decryption.
+///
+/// # Example
+///
+/// ```
+/// use warden_core::store::DbCipher;
+/// use zeroize::Zeroizing;
+///
+/// // Generate or load a 32-byte key (use secure random in production)
+/// let key = Zeroizing::new([0x42u8; 32]);
+/// let cipher = DbCipher::new(&key);
+///
+/// // Encrypt
+/// let plaintext = b"sensitive data";
+/// let ciphertext = cipher.encrypt(plaintext).expect("encryption failed");
+///
+/// // Decrypt
+/// let decrypted = cipher.decrypt(&ciphertext).expect("decryption failed");
+/// assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+/// ```
+///
+/// # Testing Recommendations
+///
+/// Beyond basic round-trip tests, validate:
+/// - Wrong-key decryption returns an error (not garbage)
+/// - Truncated/corrupted ciphertext returns an error
+/// - Hex parsing errors are handled gracefully in [`from_hex`](Self::from_hex)
+/// - Nonce uniqueness across multiple encryptions
+#[derive(Clone)]
+pub struct DbCipher {
+    cipher: ChaCha20Poly1305,
+}
+
+impl DbCipher {
+    /// Creates a new cipher from a 32-byte encryption key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - A 256-bit (32-byte) encryption key. Should be generated from a
+    ///   cryptographically secure random source.
+    ///
+    /// # Security
+    ///
+    /// The caller should wrap the key in [`Zeroizing`] to ensure it is zeroed
+    /// when dropped. Do not log, serialize, or persist the key alongside encrypted data.
+    ///
+    /// # Panics
+    ///
+    /// This function will not panic as the key size is enforced by the type system.
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new_from_slice(key).expect("key is 32 bytes"),
+        }
+    }
+
+    /// Creates a new cipher from a hex-encoded 32-byte key.
+    ///
+    /// # Arguments
+    ///
+    /// * `hex_key` - A 64-character hex string representing a 32-byte key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - The hex string contains invalid characters
+    /// - The decoded key is not exactly 32 bytes (hex string not 64 chars)
+    ///
+    /// # Security
+    ///
+    /// Key bytes are decoded directly into a [`Zeroizing`] buffer with no
+    /// intermediate allocations, ensuring all key material is zeroed on drop.
+    pub fn from_hex(hex_key: &str) -> Result<Self> {
+        // Decode directly into a pre-zeroized fixed buffer - no intermediate Vec
+        let mut key = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(hex_key, &mut *key).map_err(|e| Error::Encryption(e.to_string()))?;
+        Ok(Self::new(&key))
+    }
+
+    /// Encrypts plaintext using ChaCha20-Poly1305.
+    ///
+    /// Generates a unique random 96-bit nonce for each encryption and prepends
+    /// it to the ciphertext for self-contained decryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `plaintext` - The data to encrypt.
+    ///
+    /// # Returns
+    ///
+    /// A byte vector containing `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - Random nonce generation fails (system entropy exhausted)
+    /// - Encryption fails (should not happen with valid inputs)
+    ///
+    /// # Security
+    ///
+    /// Each call generates a fresh random nonce. Never reuse nonces with the same key.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| Error::Encryption(format!("failed to generate nonce: {}", e)))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| Error::Encryption(format!("encryption failed: {}", e)))?;
+
+        let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+        Ok(result)
+    }
+
+    /// Decrypts ciphertext using ChaCha20-Poly1305.
+    ///
+    /// Extracts the nonce from the first 12 bytes and decrypts the remainder.
+    /// Verifies the authentication tag to ensure data integrity.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The encrypted data in format `nonce (12 bytes) || ciphertext || auth_tag`.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encryption`] if:
+    /// - Input is shorter than the nonce size (12 bytes)
+    /// - Authentication tag verification fails (tampered or wrong key)
+    /// - Decryption fails for any other reason
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < NONCE_SIZE {
+            return Err(Error::Encryption("ciphertext too short".to_string()));
+        }
+
+        let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| Error::Encryption(format!("decryption failed: {}", e)))
+    }
+}
+
 const POLICIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("policies");
 const WALLET_BINDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_bindings");
 const ADDRESS_LISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("address_lists");
@@ -25,11 +205,57 @@ const APPROVALS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("app
 
 pub struct RedbStorage {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
 }
 
 impl RedbStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cipher(path, None)
+    }
+
+    pub fn open_encrypted(path: impl AsRef<Path>, cipher: DbCipher) -> Result<Self> {
+        Self::open_with_cipher(path, Some(cipher))
+    }
+
+    /// Opens or creates a database with optional encryption.
+    ///
+    /// # Security Note
+    ///
+    /// On Unix systems, the database file is created with mode 0o600 (owner read/write only).
+    /// For maximum security in multi-threaded environments, consider setting a restrictive
+    /// umask (e.g., `umask 0o077`) before starting the process.
+    fn open_with_cipher(path: impl AsRef<Path>, cipher: Option<DbCipher>) -> Result<Self> {
+        let path = path.as_ref();
+
+        // On Unix, pre-create file with restrictive permissions to avoid TOCTOU race
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if !path.exists() {
+                // Create file atomically with 0o600 permissions
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| {
+                        Error::Storage(format!("failed to create database file: {}", e))
+                    })?;
+            }
+        }
+
         let db = Database::create(path).map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Ensure permissions are correct (handles existing files and non-atomic fallback)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms)
+                .map_err(|e| Error::Storage(format!("failed to set file permissions: {}", e)))?;
+        }
 
         {
             let wtxn = db
@@ -50,12 +276,16 @@ impl RedbStorage {
             wtxn.commit().map_err(|e| Error::Storage(e.to_string()))?;
         }
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            cipher: cipher.map(Arc::new),
+        })
     }
 
     pub fn policy_store(&self) -> RedbPolicyStore {
         let store = RedbPolicyStore {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
             pattern_cache: RwLock::new(Vec::new()),
         };
         if let Err(e) = store.rebuild_pattern_cache() {
@@ -67,34 +297,55 @@ impl RedbStorage {
     pub fn address_list_store(&self) -> RedbAddressListStore {
         RedbAddressListStore {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
         }
     }
 
     pub fn workflow_store(&self) -> RedbWorkflowStore {
         RedbWorkflowStore {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
         }
     }
 
     pub fn group_store(&self) -> RedbGroupStore {
         RedbGroupStore {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
         }
     }
 
     pub fn approval_store(&self) -> RedbApprovalStore {
         RedbApprovalStore {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
         }
     }
 }
 
 pub struct RedbPolicyStore {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
     pattern_cache: RwLock<Vec<(String, Uuid)>>,
 }
 
 impl RedbPolicyStore {
+    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match &self.cipher {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+    }
+
     fn find_matching_binding(&self, wallet_id: &str) -> Option<Uuid> {
         let cache = self.pattern_cache.read().expect("lock poisoned");
         for (pattern, policy_id) in cache.iter() {
@@ -117,8 +368,7 @@ impl RedbPolicyStore {
         let mut patterns = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let uuid: Uuid = bincode::deserialize(id_bytes.value())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            let uuid: Uuid = self.deserialize(id_bytes.value())?;
             patterns.push((pattern.value().to_string(), uuid));
         }
 
@@ -140,7 +390,7 @@ impl PolicyStore for RedbPolicyStore {
                 .open_table(POLICIES_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let key = policy.id.as_bytes();
-            let value = bincode::serialize(&policy).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&policy)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -164,8 +414,7 @@ impl PolicyStore for RedbPolicyStore {
             .map_err(|e| Error::Storage(e.to_string()))?
         {
             Some(value) => {
-                let policy: Policy = bincode::deserialize(value.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let policy: Policy = self.deserialize(value.value())?;
                 Ok(Some(policy))
             }
             None => Ok(None),
@@ -189,8 +438,7 @@ impl PolicyStore for RedbPolicyStore {
         let mut policies = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let policy: Policy =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let policy: Policy = self.deserialize(value.value())?;
             policies.push(policy);
         }
         Ok(policies)
@@ -222,8 +470,7 @@ impl PolicyStore for RedbPolicyStore {
             let mut to_remove = Vec::new();
             for result in bindings.iter().map_err(|e| Error::Storage(e.to_string()))? {
                 let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
-                let uuid: Uuid = bincode::deserialize(id_bytes.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let uuid: Uuid = self.deserialize(id_bytes.value())?;
                 if &uuid == id {
                     to_remove.push(pattern.value().to_string());
                 }
@@ -256,8 +503,7 @@ impl PolicyStore for RedbPolicyStore {
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .ok_or_else(|| Error::NoPolicyFound(id.to_string()))?;
 
-            let mut policy: Policy =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let mut policy: Policy = self.deserialize(value.value())?;
 
             let patterns: Vec<String> = {
                 let mut all_patterns: Vec<String> = policy
@@ -276,7 +522,7 @@ impl PolicyStore for RedbPolicyStore {
             };
 
             policy.is_active = true;
-            let bytes = bincode::serialize(&policy).map_err(|e| Error::Storage(e.to_string()))?;
+            let bytes = self.serialize(&policy)?;
             (bytes, patterns)
         };
 
@@ -293,7 +539,7 @@ impl PolicyStore for RedbPolicyStore {
             let mut bindings = wtxn
                 .open_table(WALLET_BINDINGS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            let id_bytes = bincode::serialize(id).map_err(|e| Error::Storage(e.to_string()))?;
+            let id_bytes = self.serialize(id)?;
             for pattern in &wallet_patterns {
                 bindings
                     .insert(pattern.as_str(), id_bytes.as_slice())
@@ -318,21 +564,15 @@ impl PolicyStore for RedbPolicyStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let key = id.as_bytes();
 
-            let maybe_policy = {
-                table
-                    .get(key.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?
-                    .map(|value| {
-                        bincode::deserialize::<Policy>(value.value())
-                            .map_err(|e| Error::Storage(e.to_string()))
-                    })
-                    .transpose()?
-            };
+            let maybe_policy: Option<Policy> = table
+                .get(key.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .map(|value| self.deserialize(value.value()))
+                .transpose()?;
 
             if let Some(mut policy) = maybe_policy {
                 policy.is_active = false;
-                let updated =
-                    bincode::serialize(&policy).map_err(|e| Error::Storage(e.to_string()))?;
+                let updated = self.serialize(&policy)?;
                 table
                     .insert(key.as_slice(), updated.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -347,8 +587,7 @@ impl PolicyStore for RedbPolicyStore {
             let mut to_remove = Vec::new();
             for result in bindings.iter().map_err(|e| Error::Storage(e.to_string()))? {
                 let (pattern, id_bytes) = result.map_err(|e| Error::Storage(e.to_string()))?;
-                let uuid: Uuid = bincode::deserialize(id_bytes.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let uuid: Uuid = self.deserialize(id_bytes.value())?;
                 if &uuid == id {
                     to_remove.push(pattern.value().to_string());
                 }
@@ -381,6 +620,25 @@ struct AddressListData {
 
 pub struct RedbAddressListStore {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
+}
+
+impl RedbAddressListStore {
+    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match &self.cipher {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -403,7 +661,7 @@ impl AddressListStore for RedbAddressListStore {
                 let data = AddressListData {
                     addresses: Vec::new(),
                 };
-                let value = bincode::serialize(&data).map_err(|e| Error::Storage(e.to_string()))?;
+                let value = self.serialize(&data)?;
                 table
                     .insert(name, value.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -462,7 +720,7 @@ impl AddressListStore for RedbAddressListStore {
                     .get(list_name)
                     .map_err(|e| Error::Storage(e.to_string()))?
                     .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?
+                self.deserialize(value.value())?
             };
 
             if let Some(existing) = data.addresses.iter_mut().find(|e| e.address == address) {
@@ -474,7 +732,7 @@ impl AddressListStore for RedbAddressListStore {
                 });
             }
 
-            let updated = bincode::serialize(&data).map_err(|e| Error::Storage(e.to_string()))?;
+            let updated = self.serialize(&data)?;
             table
                 .insert(list_name, updated.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -498,12 +756,12 @@ impl AddressListStore for RedbAddressListStore {
                     .get(list_name)
                     .map_err(|e| Error::Storage(e.to_string()))?
                     .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?
+                self.deserialize(value.value())?
             };
 
             data.addresses.retain(|e| e.address != address);
 
-            let updated = bincode::serialize(&data).map_err(|e| Error::Storage(e.to_string()))?;
+            let updated = self.serialize(&data)?;
             table
                 .insert(list_name, updated.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -526,8 +784,7 @@ impl AddressListStore for RedbAddressListStore {
             .map_err(|e| Error::Storage(e.to_string()))?
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
 
-        let data: AddressListData =
-            bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+        let data: AddressListData = self.deserialize(value.value())?;
 
         Ok(data.addresses.iter().any(|e| e.address == address))
     }
@@ -546,8 +803,7 @@ impl AddressListStore for RedbAddressListStore {
             .map_err(|e| Error::Storage(e.to_string()))?
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
 
-        let data: AddressListData =
-            bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+        let data: AddressListData = self.deserialize(value.value())?;
 
         Ok(data.addresses)
     }
@@ -555,6 +811,25 @@ impl AddressListStore for RedbAddressListStore {
 
 pub struct RedbWorkflowStore {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
+}
+
+impl RedbWorkflowStore {
+    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match &self.cipher {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -569,7 +844,7 @@ impl WorkflowStore for RedbWorkflowStore {
                 .open_table(WORKFLOWS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let key = workflow.id.as_bytes();
-            let value = bincode::serialize(&workflow).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&workflow)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -593,8 +868,7 @@ impl WorkflowStore for RedbWorkflowStore {
             .map_err(|e| Error::Storage(e.to_string()))?
         {
             Some(value) => {
-                let workflow: ApprovalWorkflow = bincode::deserialize(value.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
                 Ok(Some(workflow))
             }
             None => Ok(None),
@@ -615,8 +889,7 @@ impl WorkflowStore for RedbWorkflowStore {
 
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let workflow: ApprovalWorkflow =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.transaction_id == *transaction_id {
                 return Ok(Some(workflow));
             }
@@ -640,8 +913,7 @@ impl WorkflowStore for RedbWorkflowStore {
         let mut workflows = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let workflow: ApprovalWorkflow =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.status == WorkflowStatus::Pending {
                 workflows.push(workflow);
             }
@@ -665,8 +937,7 @@ impl WorkflowStore for RedbWorkflowStore {
         let mut workflows = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let workflow: ApprovalWorkflow =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let workflow: ApprovalWorkflow = self.deserialize(value.value())?;
             if workflow.status == WorkflowStatus::Pending {
                 let required_groups = workflow.requirement.all_groups();
                 if groups.iter().any(|g| required_groups.contains(g)) {
@@ -697,13 +968,12 @@ impl WorkflowStore for RedbWorkflowStore {
                 .get(key.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .ok_or_else(|| Error::WorkflowNotFound(workflow_id.to_string()))
-                .and_then(|v| {
-                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
-                })?;
+                .map(|v| self.deserialize(v.value()))
+                .and_then(|r| r)?;
 
             workflow.add_approval(approval);
 
-            let value = bincode::serialize(&workflow).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&workflow)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -718,6 +988,25 @@ impl WorkflowStore for RedbWorkflowStore {
 
 pub struct RedbGroupStore {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
+}
+
+impl RedbGroupStore {
+    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match &self.cipher {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -732,7 +1021,7 @@ impl GroupStore for RedbGroupStore {
                 .open_table(GROUPS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let key = group.id.as_bytes();
-            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -756,8 +1045,7 @@ impl GroupStore for RedbGroupStore {
             .map_err(|e| Error::Storage(e.to_string()))?
         {
             Some(value) => {
-                let group: ApproverGroup = bincode::deserialize(value.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let group: ApproverGroup = self.deserialize(value.value())?;
                 Ok(Some(group))
             }
             None => Ok(None),
@@ -781,8 +1069,7 @@ impl GroupStore for RedbGroupStore {
         let mut groups = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let group: ApproverGroup =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let group: ApproverGroup = self.deserialize(value.value())?;
             groups.push(group);
         }
         Ok(groups)
@@ -826,9 +1113,8 @@ impl GroupStore for RedbGroupStore {
                 .get(key.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
-                .and_then(|v| {
-                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
-                })?;
+                .map(|v| self.deserialize(v.value()))
+                .and_then(|r| r)?;
 
             if !group
                 .members
@@ -839,7 +1125,7 @@ impl GroupStore for RedbGroupStore {
                 group.updated_at = chrono::Utc::now();
             }
 
-            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -867,14 +1153,13 @@ impl GroupStore for RedbGroupStore {
                 .get(key.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .ok_or_else(|| Error::GroupNotFound(group_id.to_string()))
-                .and_then(|v| {
-                    bincode::deserialize(v.value()).map_err(|e| Error::Storage(e.to_string()))
-                })?;
+                .map(|v| self.deserialize(v.value()))
+                .and_then(|r| r)?;
 
             group.members.retain(|m| m.approver_id != approver_id);
             group.updated_at = chrono::Utc::now();
 
-            let value = bincode::serialize(&group).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&group)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -897,6 +1182,25 @@ impl GroupStore for RedbGroupStore {
 
 pub struct RedbApprovalStore {
     db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
+}
+
+impl RedbApprovalStore {
+    fn serialize<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+        let plaintext = bincode::serialize(value).map_err(|e| Error::Storage(e.to_string()))?;
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(&plaintext),
+            None => Ok(plaintext),
+        }
+    }
+
+    fn deserialize<T: serde::de::DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
+        let plaintext = match &self.cipher {
+            Some(cipher) => cipher.decrypt(data)?,
+            None => data.to_vec(),
+        };
+        bincode::deserialize(&plaintext).map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -911,7 +1215,7 @@ impl ApprovalStore for RedbApprovalStore {
                 .open_table(APPROVALS_TABLE)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let key = request.id.as_bytes();
-            let value = bincode::serialize(&request).map_err(|e| Error::Storage(e.to_string()))?;
+            let value = self.serialize(&request)?;
             table
                 .insert(key.as_slice(), value.as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -935,8 +1239,7 @@ impl ApprovalStore for RedbApprovalStore {
             .map_err(|e| Error::Storage(e.to_string()))?
         {
             Some(value) => {
-                let request: ApprovalRequest = bincode::deserialize(value.value())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let request: ApprovalRequest = self.deserialize(value.value())?;
                 Ok(Some(request))
             }
             None => Ok(None),
@@ -954,8 +1257,7 @@ impl ApprovalStore for RedbApprovalStore {
 
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let request: ApprovalRequest =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let request: ApprovalRequest = self.deserialize(value.value())?;
             if request.transaction_id == *transaction_id {
                 return Ok(Some(request));
             }
@@ -979,8 +1281,7 @@ impl ApprovalStore for RedbApprovalStore {
         let mut requests = Vec::new();
         for result in table.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (_, value) = result.map_err(|e| Error::Storage(e.to_string()))?;
-            let request: ApprovalRequest =
-                bincode::deserialize(value.value()).map_err(|e| Error::Storage(e.to_string()))?;
+            let request: ApprovalRequest = self.deserialize(value.value())?;
             if request.status == ApprovalStatus::Pending {
                 requests.push(request);
             }
@@ -1126,6 +1427,81 @@ mod tests {
         assert!(
             fallback.is_some(),
             "should fall back to active policy when no binding matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_redb_policy_store() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("encrypted.db");
+        let key = [0x42u8; 32];
+        let cipher = DbCipher::new(&key);
+        let storage = RedbStorage::open_encrypted(&db_path, cipher).unwrap();
+        let store = storage.policy_store();
+
+        let policy = Policy {
+            id: Uuid::new_v4(),
+            version: "1.0".into(),
+            name: "encrypted-test".into(),
+            description: None,
+            rules: vec![Rule {
+                id: "test".into(),
+                description: None,
+                conditions: Conditions::default(),
+                action: Action::Allow,
+                approval: None,
+            }],
+            default_action: Action::Deny,
+            content_hash: None,
+            created_at: None,
+            created_by: None,
+            is_active: false,
+        };
+
+        let created = store.create(policy.clone()).await.unwrap();
+        assert_eq!(created.name, "encrypted-test");
+
+        let fetched = store.get(&created.id).await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().name, "encrypted-test");
+
+        let raw_bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !raw_bytes
+                .windows(b"encrypted-test".len())
+                .any(|w| w == b"encrypted-test"),
+            "policy name should not appear in plaintext in database file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_cipher_from_hex() {
+        let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cipher = DbCipher::from_hex(hex_key).unwrap();
+
+        let plaintext = b"test data";
+        let encrypted = cipher.encrypt(plaintext).unwrap();
+        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+
+        assert!(DbCipher::from_hex("tooshort").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("perms.db");
+        let _storage = RedbStorage::open(&db_path).unwrap();
+
+        let metadata = std::fs::metadata(&db_path).unwrap();
+        let mode = metadata.permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "database file should have 0600 permissions"
         );
     }
 }
