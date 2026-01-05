@@ -4,6 +4,8 @@ use warden_core::{
     WorkflowStore,
 };
 
+use crate::auth::{AuthState, HasAuthState};
+
 #[derive(Clone)]
 pub struct AppState {
     pub policy_store: Arc<dyn PolicyStore>,
@@ -14,9 +16,11 @@ pub struct AppState {
     pub group_store: Arc<dyn GroupStore>,
     pub evaluator: Arc<PolicyEvaluator>,
     pub backend_registry: Arc<BackendRegistry>,
+    pub auth_state: AuthState,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy_store: Arc<dyn PolicyStore>,
         whitelist_store: Arc<dyn AddressListStore>,
@@ -25,6 +29,7 @@ impl AppState {
         workflow_store: Arc<dyn WorkflowStore>,
         group_store: Arc<dyn GroupStore>,
         backend_registry: Arc<BackendRegistry>,
+        auth_state: AuthState,
     ) -> Self {
         let evaluator = Arc::new(PolicyEvaluator::new(
             Arc::clone(&policy_store),
@@ -41,6 +46,13 @@ impl AppState {
             group_store,
             evaluator,
             backend_registry,
+            auth_state,
         }
+    }
+}
+
+impl HasAuthState for AppState {
+    fn auth_state(&self) -> &AuthState {
+        &self.auth_state
     }
 }

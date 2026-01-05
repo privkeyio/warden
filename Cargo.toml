@@ -43,6 +43,9 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "h
 indexmap = "2"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+tower = { version = "0.5.2", features = ["util"] }
+jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
+governor = "0.10"
 tempfile = "3.10"
 directories = "5"
 getrandom = "0.2"

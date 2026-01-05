@@ -22,4 +22,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 axum-server = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
 
