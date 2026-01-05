@@ -8,8 +8,8 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::quorum::GroupId;
+use crate::secrets::SecretValue;
 use crate::Result;
-use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproverGroup {
@@ -133,11 +133,11 @@ pub enum NotificationChannel {
     },
     Webhook {
         url: String,
-        secret: Zeroizing<String>,
+        secret: SecretValue,
     },
     Slack {
         channel_id: String,
-        token: Zeroizing<String>,
+        token: SecretValue,
     },
     Nostr {
         pubkey: String,
