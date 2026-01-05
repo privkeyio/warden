@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use warden_core::{
-    AddressListStore, ApprovalStore, BackendRegistry, GroupStore, PolicyEvaluator, PolicyStore,
-    WorkflowStore,
+    AddressListStore, ApprovalStore, BackendRegistry, EnclaveClient, GroupStore, PolicyEvaluator,
+    PolicyStore, WorkflowStore,
 };
 
 use crate::auth::{AuthState, HasAuthState};
@@ -16,6 +16,7 @@ pub struct AppState {
     pub group_store: Arc<dyn GroupStore>,
     pub evaluator: Arc<PolicyEvaluator>,
     pub backend_registry: Arc<BackendRegistry>,
+    pub enclave_client: Option<Arc<dyn EnclaveClient>>,
     pub auth_state: AuthState,
 }
 
@@ -29,6 +30,7 @@ impl AppState {
         workflow_store: Arc<dyn WorkflowStore>,
         group_store: Arc<dyn GroupStore>,
         backend_registry: Arc<BackendRegistry>,
+        enclave_client: Option<Arc<dyn EnclaveClient>>,
         auth_state: AuthState,
     ) -> Self {
         let evaluator = Arc::new(PolicyEvaluator::new(
@@ -46,6 +48,7 @@ impl AppState {
             group_store,
             evaluator,
             backend_registry,
+            enclave_client,
             auth_state,
         }
     }

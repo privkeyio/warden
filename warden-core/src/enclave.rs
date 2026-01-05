@@ -391,20 +391,27 @@ fn rand_bytes() -> [u8; 32] {
     bytes
 }
 
+#[cfg(any(test, feature = "mock"))]
 pub struct MockEnclaveClient {}
 
+#[cfg(any(test, feature = "mock"))]
 impl MockEnclaveClient {
     pub fn new() -> Self {
+        tracing::warn!(
+            "MockEnclaveClient initialized - this backend always returns Allow and should NEVER be used in production"
+        );
         Self {}
     }
 }
 
+#[cfg(any(test, feature = "mock"))]
 impl Default for MockEnclaveClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "mock"))]
 #[async_trait::async_trait]
 impl EnclaveClient for MockEnclaveClient {
     async fn evaluate(&self, _request: EvaluationRequest) -> Result<EvaluationResult> {

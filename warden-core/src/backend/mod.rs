@@ -3,7 +3,9 @@
 mod keep;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+#[cfg(any(test, feature = "mock"))]
+use chrono::Duration;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -165,24 +167,31 @@ impl Default for BackendRegistry {
     }
 }
 
+#[cfg(any(test, feature = "mock"))]
 pub struct MockSigningBackend {
     sessions: RwLock<HashMap<SessionId, SigningSession>>,
 }
 
+#[cfg(any(test, feature = "mock"))]
 impl MockSigningBackend {
     pub fn new() -> Self {
+        tracing::warn!(
+            "MockSigningBackend initialized - this backend always succeeds and should NEVER be used in production"
+        );
         Self {
             sessions: RwLock::new(HashMap::new()),
         }
     }
 }
 
+#[cfg(any(test, feature = "mock"))]
 impl Default for MockSigningBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "mock"))]
 #[async_trait]
 impl SigningBackend for MockSigningBackend {
     fn backend_id(&self) -> &str {

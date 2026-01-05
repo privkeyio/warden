@@ -28,9 +28,11 @@ pub use approval::{
     InMemoryApprovalStore, InMemoryWorkflowStore, TransactionDetails, WorkflowStatus,
     WorkflowStore,
 };
+#[cfg(any(test, feature = "mock"))]
+pub use backend::MockSigningBackend;
 pub use backend::{
-    BackendRegistry, HealthStatus, MockSigningBackend, SessionId, SessionStatus, SigningBackend,
-    SigningPayload, SigningRequest, SigningSession, StubKeepBackend,
+    BackendRegistry, HealthStatus, SessionId, SessionStatus, SigningBackend, SigningPayload,
+    SigningRequest, SigningSession, StubKeepBackend,
 };
 pub use config::Config;
 pub use error::{Error, Result};
@@ -91,10 +93,12 @@ pub use compliance::{
     EllipticClient, EllipticConfig, ExposureCategory, ExposureInfo, MockComplianceProvider,
     ScreeningResult,
 };
+#[cfg(any(test, feature = "mock"))]
+pub use enclave::MockEnclaveClient;
 pub use enclave::{
     BundleData, EnclaveClient, EnclaveConfig, EnclaveDecision, EnclaveProxy, EnclaveRequest,
     EnclaveResponse, ErrorCode as EnclaveErrorCode, EvaluationRequest,
-    EvaluationResult as EnclaveEvaluationResult, ExpectedPcrs, MockEnclaveClient, PcrConfig,
+    EvaluationResult as EnclaveEvaluationResult, ExpectedPcrs, PcrConfig,
     SessionStatus as EnclaveSessionStatus, SigningInitRequest,
     SigningSession as EnclaveSigningSession, VerifiedAttestation, ENCLAVE_CID, VSOCK_PORT,
 };

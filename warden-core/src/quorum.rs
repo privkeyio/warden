@@ -170,6 +170,7 @@ impl QuorumEvaluator {
         Self
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     pub fn evaluate(&self, requirement: &RequirementNode, approvals: &[Approval]) -> QuorumStatus {
         match requirement {
             RequirementNode::Threshold { threshold, group } => {

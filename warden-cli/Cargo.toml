@@ -8,6 +8,10 @@ license.workspace = true
 name = "warden"
 path = "src/main.rs"
 
+[features]
+default = []
+mock = ["warden-core/mock"]
+
 [dependencies]
 warden-core = { workspace = true }
 warden-api = { workspace = true }
