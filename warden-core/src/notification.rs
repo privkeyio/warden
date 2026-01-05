@@ -297,7 +297,7 @@ fn notification_type_name(notification: &Notification) -> String {
 
 pub struct WebhookSender {
     client: reqwest::Client,
-    default_secret: Option<String>,
+    default_secret: Option<SecretValue>,
 }
 
 impl WebhookSender {
@@ -308,7 +308,7 @@ impl WebhookSender {
         }
     }
 
-    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+    pub fn with_secret(mut self, secret: impl Into<SecretValue>) -> Self {
         self.default_secret = Some(secret.into());
         self
     }
@@ -327,7 +327,7 @@ impl WebhookSender {
     fn parse_recipient<'a>(
         &self,
         recipient: &'a str,
-    ) -> std::result::Result<(&'a str, Option<String>), NotificationError> {
+    ) -> std::result::Result<(&'a str, Option<SecretValue>), NotificationError> {
         if let Some(idx) = recipient.rfind('|') {
             let url = &recipient[..idx];
             let secret = &recipient[idx + 1..];
@@ -336,7 +336,7 @@ impl WebhookSender {
                     "invalid recipient format".into(),
                 ));
             }
-            Ok((url, Some(secret.to_string())))
+            Ok((url, Some(SecretValue::new(secret))))
         } else {
             Ok((recipient, self.default_secret.clone()))
         }
@@ -376,7 +376,7 @@ impl NotificationSender for WebhookSender {
         let payload = serde_json::to_string(notification)
             .map_err(|e| NotificationError::Permanent(e.to_string()))?;
 
-        let signature = self.sign_payload(timestamp, &payload, &secret);
+        let signature = self.sign_payload(timestamp, &payload, secret.expose());
 
         let response = self
             .client

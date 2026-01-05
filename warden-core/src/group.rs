@@ -8,6 +8,7 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::quorum::GroupId;
+use crate::secrets::SecretValue;
 use crate::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,13 +125,23 @@ impl Approver {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotificationChannel {
-    Email { address: String },
-    Webhook { url: String, secret: String },
-    Slack { channel_id: String, token: String },
-    Nostr { pubkey: String },
+    Email {
+        address: String,
+    },
+    Webhook {
+        url: String,
+        secret: SecretValue,
+    },
+    Slack {
+        channel_id: String,
+        token: SecretValue,
+    },
+    Nostr {
+        pubkey: String,
+    },
 }
 
 impl std::fmt::Debug for NotificationChannel {
