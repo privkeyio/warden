@@ -378,7 +378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls_key,
             require_tls,
         } => {
-            let is_localhost = host == "127.0.0.1" || host == "localhost" || host == "::1";
+            let host_trimmed = host.trim();
+            let is_localhost = matches!(host_trimmed, "127.0.0.1" | "localhost" | "::1" | "[::1]");
             let has_tls = tls_cert.is_some() && tls_key.is_some();
 
             if require_tls && !has_tls && !is_localhost {
@@ -408,7 +409,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stores.backend_registry,
             );
             let app = warden_api::create_router(state);
-            let addr = format!("{}:{}", host, port);
+            let addr = if host_trimmed.starts_with('[') && host_trimmed.ends_with(']') {
+                format!("{}:{}", host_trimmed, port)
+            } else if host_trimmed.contains(':') {
+                format!("[{}]:{}", host_trimmed, port)
+            } else {
+                format!("{}:{}", host_trimmed, port)
+            };
 
             let result = if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
                 println!("Starting Warden API server on https://{}", addr);
@@ -423,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
             } else {
                 if !is_localhost {
-                    if host == "0.0.0.0" {
+                    if host_trimmed == "0.0.0.0" {
                         eprintln!(
                             "Warning: Binding to 0.0.0.0 without TLS exposes the API on ALL network interfaces. \
                              This is insecure for production. Use --require-tls to enforce TLS."
