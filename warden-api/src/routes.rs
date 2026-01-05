@@ -1,15 +1,65 @@
 use axum::{
+    http::{header, HeaderValue, Method},
     middleware,
     routing::{delete, get, post, put},
     Router,
 };
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    limit::RequestBodyLimitLayer,
+    trace::TraceLayer,
+};
 
 use crate::auth::rate_limit_middleware;
 use crate::handlers;
 use crate::state::AppState;
 
+const MAX_BODY_SIZE: usize = 1024 * 1024;
+
+fn cors_allowed_origins() -> AllowOrigin {
+    match std::env::var("CORS_ALLOWED_ORIGINS") {
+        Ok(origins) if origins.trim() == "*" => {
+            tracing::warn!(
+                "CORS configured to allow any origin (CORS_ALLOWED_ORIGINS=*). \
+                 This should only be used in development."
+            );
+            AllowOrigin::any()
+        }
+        Ok(origins) if !origins.is_empty() => {
+            let origins: Vec<HeaderValue> = origins
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if origins.is_empty() {
+                tracing::warn!("CORS_ALLOWED_ORIGINS set but no valid origins parsed, denying all");
+                AllowOrigin::list([])
+            } else {
+                tracing::info!("CORS configured with {} allowed origins", origins.len());
+                AllowOrigin::list(origins)
+            }
+        }
+        _ => {
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS not set, CORS requests will be denied. \
+                 Set CORS_ALLOWED_ORIGINS=* for development or specify allowed origins."
+            );
+            AllowOrigin::list([])
+        }
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+        .allow_origin(cors_allowed_origins());
+
     let api_router = Router::new()
         .nest("/v1", api_v1())
         .layer(middleware::from_fn_with_state(
@@ -20,7 +70,9 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health_check))
         .merge(api_router)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TraceLayer::new_for_http())
+        .layer(cors)
         .with_state(state)
 }
 
