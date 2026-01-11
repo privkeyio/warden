@@ -12,9 +12,9 @@ repository = "https://github.com/privkeyio/warden"
 warden-core = { path = "warden-core" }
 warden-api = { path = "warden-api" }
 
-keep-core = { git = "https://github.com/privkeyio/keep", tag = "v0.1.1" }
-keep-frost-net = { git = "https://github.com/privkeyio/keep", tag = "v0.1.1" }
-keep-enclave-host = { git = "https://github.com/privkeyio/keep", tag = "v0.1.1" }
+keep-core = { git = "https://github.com/privkeyio/keep", branch = "main" }
+keep-frost-net = { git = "https://github.com/privkeyio/keep", branch = "main" }
+keep-enclave-host = { git = "https://github.com/privkeyio/keep", branch = "main" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -38,7 +38,7 @@ hex = "0.4"
 regex = "1"
 base64 = "0.22"
 reqwest = { version = "0.12.8", features = ["json"] }
-nostr-sdk = { version = "0.38", default-features = false, features = ["nip59"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip59"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 indexmap = "2"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
@@ -52,6 +52,7 @@ getrandom = "0.2"
 secrecy = { version = "0.10", features = ["serde"] }
 aws-config = "1"
 aws-sdk-secretsmanager = "1"
+parking_lot = "0.12"
 
 [profile.release]
 lto = true
