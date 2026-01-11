@@ -129,7 +129,7 @@ impl NotificationSender for NostrSender {
 
         client.connect().await;
 
-        match client.send_event(gift_wrap).await {
+        match client.send_event(&gift_wrap).await {
             Ok(output) => {
                 tracing::info!(
                     recipient_pubkey = %recipient,

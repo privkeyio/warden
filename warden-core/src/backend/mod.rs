@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 #[cfg(feature = "keep")]
-pub use keep::KeepFrostBackend;
+pub use keep::{KeepFrostBackend, SigningAuthorization, SigningSessionContext, WardenSigningHooks};
 pub use keep::{KeepFrostConfig, StubKeepBackend};
 
 pub type SessionId = Uuid;

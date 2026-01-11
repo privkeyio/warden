@@ -39,6 +39,7 @@ getrandom = { workspace = true }
 secrecy = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-secretsmanager = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
