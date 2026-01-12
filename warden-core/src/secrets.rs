@@ -5,6 +5,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
+use crate::ssrf::{validate_url, SsrfError, SsrfPolicy};
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SecretsError {
     #[error("secret not found: {0}")]
@@ -13,6 +15,8 @@ pub enum SecretsError {
     Provider(String),
     #[error("configuration error: {0}")]
     Configuration(String),
+    #[error("SSRF validation failed: {0}")]
+    SsrfBlocked(#[from] SsrfError),
 }
 
 #[derive(Clone)]
@@ -191,7 +195,18 @@ pub struct VaultSecretsProvider {
 }
 
 impl VaultSecretsProvider {
-    pub fn new(config: VaultConfig) -> Self {
+    pub fn new(config: VaultConfig) -> Result<Self, SecretsError> {
+        validate_url(&config.address, &SsrfPolicy::strict())?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                config.timeout_seconds as u64,
+            ))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, client })
+    }
+
+    pub fn new_unchecked(config: VaultConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 config.timeout_seconds as u64,
@@ -275,7 +290,23 @@ pub struct AwsSecretsManagerProvider {
 }
 
 impl AwsSecretsManagerProvider {
-    pub async fn new(config: AwsSecretsManagerConfig) -> Self {
+    pub async fn new(config: AwsSecretsManagerConfig) -> Result<Self, SecretsError> {
+        if let Some(ref endpoint) = config.endpoint_url {
+            validate_url(endpoint, &SsrfPolicy::strict())?;
+        }
+
+        let region = aws_sdk_secretsmanager::config::Region::new(config.region);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+
+        if let Some(endpoint) = config.endpoint_url {
+            loader = loader.endpoint_url(endpoint);
+        }
+
+        let client = aws_sdk_secretsmanager::Client::new(&loader.load().await);
+        Ok(Self { client })
+    }
+
+    pub async fn new_unchecked(config: AwsSecretsManagerConfig) -> Self {
         let region = aws_sdk_secretsmanager::config::Region::new(config.region);
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
 
