@@ -62,8 +62,8 @@ pub use quorum::{
 };
 pub use risk::{RiskConfig, RiskEngine, RiskFactors, RiskLevel, RiskScore};
 pub use store::{
-    AddressEntry, AddressListStore, InMemoryAddressListStore, InMemoryPolicyStore, PolicyStore,
-    RedbAddressListStore, RedbApprovalStore, RedbPolicyStore, RedbStorage,
+    AddressEntry, AddressListStore, DbCipher, InMemoryAddressListStore, InMemoryPolicyStore,
+    PolicyStore, RedbAddressListStore, RedbApprovalStore, RedbPolicyStore, RedbStorage,
 };
 pub use velocity::{
     InMemoryVelocityStore, VelocityCheck, VelocityLimits, VelocityStore, VelocityTracker,
