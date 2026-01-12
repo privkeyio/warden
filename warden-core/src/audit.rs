@@ -607,6 +607,17 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
         let event_type_bytes = serde_json::to_vec(&event.event_type)
             .map_err(|e| Error::Serialization(e.to_string()))?;
         hasher.update(&event_type_bytes);
+        if let Some(ref actor) = event.actor {
+            let actor_bytes = serde_json::to_vec(actor)
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            hasher.update(&actor_bytes);
+        }
+        let resource_bytes = serde_json::to_vec(&event.resource)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+        hasher.update(&resource_bytes);
+        let details_bytes = serde_json::to_vec(&event.details)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+        hasher.update(&details_bytes);
         hasher.update(event.previous_hash);
 
         Ok(hasher.finalize().into())
