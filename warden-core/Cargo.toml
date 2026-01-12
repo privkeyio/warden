@@ -25,6 +25,11 @@ async-trait = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
+cms = { workspace = true }
+x509-cert = { workspace = true }
+der = { workspace = true }
+const-oid = { workspace = true }
+spki = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }

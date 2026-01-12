@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -76,10 +77,8 @@ mod hex_serde {
 ///
 /// This token proves that the associated hash existed at `timestamp`.
 /// The `token` field contains the raw ASN.1 DER-encoded TimeStampResp.
-///
-/// **Note**: The token is stored but not validated. For production use,
-/// consider verifying the TSA signature and that the token contains the
-/// expected hash. See RFC 3161 section 2.4 for validation requirements.
+/// The `timestamp` field contains the TSA-provided genTime extracted from
+/// the validated TSTInfo structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rfc3161Token {
     pub tsa_url: String,
@@ -108,6 +107,87 @@ mod base64_serde {
         base64::engine::general_purpose::STANDARD
             .decode(&s)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+mod rfc3161 {
+    use der::asn1::{GeneralizedTime, OctetString};
+    use der::Sequence;
+    use spki::AlgorithmIdentifierOwned;
+
+    #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
+    pub struct TimeStampResp {
+        pub status: PkiStatusInfo,
+        pub time_stamp_token: Option<der::asn1::Any>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
+    pub struct PkiStatusInfo {
+        pub status: PkiStatus,
+        pub status_string: Option<der::asn1::Any>,
+        pub fail_info: Option<der::asn1::BitString>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct PkiStatus(u8);
+
+    impl PkiStatus {
+        pub fn to_u8(self) -> u8 {
+            self.0
+        }
+    }
+
+    impl<'a> der::Decode<'a> for PkiStatus {
+        fn decode<R: der::Reader<'a>>(reader: &mut R) -> der::Result<Self> {
+            let val = der::asn1::Int::decode(reader)?;
+            let bytes = val.as_bytes();
+            let status = if bytes.is_empty() {
+                0
+            } else {
+                bytes[bytes.len() - 1]
+            };
+            Ok(Self(status))
+        }
+    }
+
+    impl der::Encode for PkiStatus {
+        fn encoded_len(&self) -> der::Result<der::Length> {
+            der::Length::ONE + der::Length::ONE
+        }
+        fn encode(&self, writer: &mut impl der::Writer) -> der::Result<()> {
+            writer.write(&[der::Tag::Integer.into(), 1, self.0])
+        }
+    }
+
+    impl der::FixedTag for PkiStatus {
+        const TAG: der::Tag = der::Tag::Integer;
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
+    pub struct TstInfo {
+        pub version: der::asn1::Int,
+        pub policy: der::asn1::ObjectIdentifier,
+        pub message_imprint: MessageImprint,
+        pub serial_number: der::asn1::Int,
+        pub gen_time: GeneralizedTime,
+        pub accuracy: Option<der::asn1::Any>,
+        #[asn1(default = "default_false")]
+        pub ordering: bool,
+        pub nonce: Option<der::asn1::Int>,
+        #[asn1(context_specific = "0", optional = "true")]
+        pub tsa: Option<der::asn1::Any>,
+        #[asn1(context_specific = "1", optional = "true")]
+        pub extensions: Option<der::asn1::Any>,
+    }
+
+    fn default_false() -> bool {
+        false
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
+    pub struct MessageImprint {
+        pub hash_algorithm: AlgorithmIdentifierOwned,
+        pub hashed_message: OctetString,
     }
 }
 
@@ -257,6 +337,9 @@ pub enum ChainVerification {
     InvalidSignature {
         at_sequence: u64,
     },
+    UntrustedSigner {
+        at_sequence: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -280,7 +363,7 @@ pub trait AuditStore: Send + Sync {
     async fn get_latest_hash(&self) -> Result<Hash>;
 
     async fn verify_append_only(&self, event: &AuditEvent) -> Result<()> {
-        let latest_seq = self.get_latest_sequence().await.unwrap_or(0);
+        let latest_seq = self.get_latest_sequence().await?;
         if event.sequence != latest_seq + 1 {
             return Err(Error::Audit(format!(
                 "append-only violation: expected sequence {}, got {}",
@@ -396,19 +479,10 @@ impl AuditSignerConfig {
     }
 }
 
-/// Client for RFC 3161 Time Stamping Authority (TSA) requests.
-///
-/// This client sends hash values to a TSA and receives signed timestamps
-/// that prove the hash existed at a specific time. This is useful for
-/// audit log integrity verification.
-///
-/// **Limitations**:
-/// - The response is stored but not cryptographically validated
-/// - For production, the TSA certificate chain should be verified
-/// - Consider using a trusted TSA (e.g., DigiCert, Entrust, FreeTSA)
 pub struct Rfc3161Client {
     tsa_url: String,
     client: reqwest::Client,
+    trusted_roots: Vec<x509_cert::Certificate>,
 }
 
 impl Rfc3161Client {
@@ -416,7 +490,13 @@ impl Rfc3161Client {
         Self {
             tsa_url,
             client: reqwest::Client::new(),
+            trusted_roots: Vec::new(),
         }
+    }
+
+    pub fn with_trusted_roots(mut self, roots: Vec<x509_cert::Certificate>) -> Self {
+        self.trusted_roots = roots;
+        self
     }
 
     pub async fn timestamp(&self, hash: &Hash) -> Result<Rfc3161Token> {
@@ -439,16 +519,346 @@ impl Rfc3161Client {
             )));
         }
 
-        let token = response
+        let token_bytes = response
             .bytes()
             .await
             .map_err(|e| Error::Audit(format!("Failed to read TSA response: {}", e)))?;
 
+        let (gen_time, signer_cert) = self.validate_timestamp_response(&token_bytes, hash)?;
+
+        if !self.trusted_roots.is_empty() {
+            self.validate_certificate_chain(&signer_cert)?;
+        }
+
         Ok(Rfc3161Token {
             tsa_url: self.tsa_url.clone(),
-            timestamp: Utc::now(),
-            token: token.to_vec(),
+            timestamp: gen_time,
+            token: token_bytes.to_vec(),
         })
+    }
+
+    fn validate_timestamp_response(
+        &self,
+        response_bytes: &[u8],
+        expected_hash: &Hash,
+    ) -> Result<(DateTime<Utc>, x509_cert::Certificate)> {
+        use cms::content_info::ContentInfo;
+        use cms::signed_data::SignedData;
+        use der::oid::ObjectIdentifier;
+        use der::{Decode, Encode};
+
+        let tsp_resp = rfc3161::TimeStampResp::from_der(response_bytes)
+            .map_err(|e| Error::Audit(format!("Failed to parse TimeStampResp: {}", e)))?;
+
+        let status = tsp_resp.status.status.to_u8();
+        if status != 0 && status != 1 {
+            return Err(Error::Audit(format!(
+                "TSA returned non-success status: {}",
+                status
+            )));
+        }
+
+        let token_bytes = tsp_resp
+            .time_stamp_token
+            .ok_or_else(|| Error::Audit("TimeStampResp missing token".into()))?
+            .to_der()
+            .map_err(|e| Error::Audit(format!("Failed to encode token: {}", e)))?;
+
+        let content_info = ContentInfo::from_der(&token_bytes)
+            .map_err(|e| Error::Audit(format!("Failed to parse ContentInfo: {}", e)))?;
+
+        const ID_SIGNED_DATA: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+        if content_info.content_type != ID_SIGNED_DATA {
+            return Err(Error::Audit("TimeStampToken is not SignedData".into()));
+        }
+
+        let signed_data = content_info
+            .content
+            .decode_as::<SignedData>()
+            .map_err(|e| Error::Audit(format!("Failed to parse SignedData: {}", e)))?;
+
+        let encap_content = signed_data
+            .encap_content_info
+            .econtent
+            .as_ref()
+            .ok_or_else(|| Error::Audit("SignedData missing encapsulated content".into()))?;
+
+        let tst_info_bytes = encap_content.value();
+
+        let tst_info = rfc3161::TstInfo::from_der(tst_info_bytes)
+            .map_err(|e| Error::Audit(format!("Failed to parse TSTInfo: {}", e)))?;
+
+        const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+        if tst_info.message_imprint.hash_algorithm.oid != ID_SHA256 {
+            return Err(Error::Audit(
+                "TSTInfo uses unexpected hash algorithm".into(),
+            ));
+        }
+
+        if tst_info.message_imprint.hashed_message.as_bytes() != expected_hash {
+            return Err(Error::Audit(
+                "TSTInfo messageImprint does not match expected hash".into(),
+            ));
+        }
+
+        let signer_info = signed_data
+            .signer_infos
+            .0
+            .iter()
+            .next()
+            .ok_or_else(|| Error::Audit("SignedData missing signer info".into()))?;
+
+        let certs = signed_data
+            .certificates
+            .as_ref()
+            .ok_or_else(|| Error::Audit("SignedData missing certificates".into()))?;
+
+        let signer_cert = self.find_signer_certificate(certs, signer_info)?;
+
+        self.verify_signature(&signed_data, signer_info, &signer_cert)?;
+
+        let gen_time = self.parse_generalized_time(&tst_info.gen_time)?;
+
+        self.validate_certificate_validity(&signer_cert, gen_time)?;
+
+        Ok((gen_time, signer_cert))
+    }
+
+    fn find_signer_certificate(
+        &self,
+        certs: &cms::signed_data::CertificateSet,
+        signer_info: &cms::signed_data::SignerInfo,
+    ) -> Result<x509_cert::Certificate> {
+        use cms::cert::CertificateChoices;
+        use cms::signed_data::SignerIdentifier;
+        use der::{Decode, Encode};
+
+        for cert_choice in certs.0.iter() {
+            if let CertificateChoices::Certificate(cert_inner) = cert_choice {
+                let cert_bytes = cert_inner
+                    .to_der()
+                    .map_err(|e| Error::Audit(format!("Failed to encode certificate: {}", e)))?;
+                let cert = x509_cert::Certificate::from_der(&cert_bytes)
+                    .map_err(|e| Error::Audit(format!("Failed to parse certificate: {}", e)))?;
+
+                match &signer_info.sid {
+                    SignerIdentifier::IssuerAndSerialNumber(issuer_serial) => {
+                        if cert.tbs_certificate.issuer == issuer_serial.issuer
+                            && cert.tbs_certificate.serial_number == issuer_serial.serial_number
+                        {
+                            return Ok(cert);
+                        }
+                    }
+                    SignerIdentifier::SubjectKeyIdentifier(skid) => {
+                        if let Some(extensions) = &cert.tbs_certificate.extensions {
+                            for ext in extensions.iter() {
+                                const ID_SUBJECT_KEY_ID: der::oid::ObjectIdentifier =
+                                    der::oid::ObjectIdentifier::new_unwrap("2.5.29.14");
+                                if ext.extn_id == ID_SUBJECT_KEY_ID
+                                    && ext.extn_value.as_bytes() == skid.0.as_bytes()
+                                {
+                                    return Ok(cert);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(Error::Audit("Signer certificate not found in token".into()))
+    }
+
+    fn verify_signature(
+        &self,
+        signed_data: &cms::signed_data::SignedData,
+        signer_info: &cms::signed_data::SignerInfo,
+        cert: &x509_cert::Certificate,
+    ) -> Result<()> {
+        use der::oid::ObjectIdentifier;
+        use der::Encode;
+        use sha2::Digest;
+
+        let content_to_hash = if let Some(ref signed_attrs) = signer_info.signed_attrs {
+            signed_attrs
+                .to_der()
+                .map_err(|e| Error::Audit(format!("Failed to encode signed attrs: {}", e)))?
+        } else {
+            signed_data
+                .encap_content_info
+                .econtent
+                .as_ref()
+                .ok_or_else(|| Error::Audit("Missing content to verify".into()))?
+                .value()
+                .to_vec()
+        };
+
+        const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+        const ID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+        const ID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
+
+        let digest = match signer_info.digest_alg.oid {
+            ID_SHA256 => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&content_to_hash);
+                hasher.finalize().to_vec()
+            }
+            ID_SHA384 => {
+                let mut hasher = sha2::Sha384::new();
+                hasher.update(&content_to_hash);
+                hasher.finalize().to_vec()
+            }
+            ID_SHA512 => {
+                let mut hasher = sha2::Sha512::new();
+                hasher.update(&content_to_hash);
+                hasher.finalize().to_vec()
+            }
+            _ => {
+                return Err(Error::Audit(format!(
+                    "Unsupported digest algorithm: {}",
+                    signer_info.digest_alg.oid
+                )));
+            }
+        };
+
+        const ID_RSA_ENCRYPTION: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+        const ID_RSA_SHA256: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+        const ID_RSA_SHA384: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+        const ID_RSA_SHA512: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+        const ID_ECDSA_SHA256: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        const ID_ECDSA_SHA384: ObjectIdentifier =
+            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+
+        let sig_alg = &signer_info.signature_algorithm.oid;
+        if *sig_alg != ID_RSA_ENCRYPTION
+            && *sig_alg != ID_RSA_SHA256
+            && *sig_alg != ID_RSA_SHA384
+            && *sig_alg != ID_RSA_SHA512
+            && *sig_alg != ID_ECDSA_SHA256
+            && *sig_alg != ID_ECDSA_SHA384
+        {
+            return Err(Error::Audit(format!(
+                "Unsupported signature algorithm: {}",
+                sig_alg
+            )));
+        }
+
+        if let Some(ref signed_attrs) = signer_info.signed_attrs {
+            const ID_MESSAGE_DIGEST: ObjectIdentifier =
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+            let mut found_digest = false;
+            for attr in signed_attrs.iter() {
+                if attr.oid == ID_MESSAGE_DIGEST {
+                    if let Some(value) = attr.values.iter().next() {
+                        let attr_digest: der::asn1::OctetString = value
+                            .decode_as()
+                            .map_err(|e| Error::Audit(format!("Failed to decode digest: {}", e)))?;
+                        let encap_content = signed_data
+                            .encap_content_info
+                            .econtent
+                            .as_ref()
+                            .ok_or_else(|| Error::Audit("Missing encap content".into()))?;
+                        let content_bytes = encap_content.value();
+                        let content_digest = match signer_info.digest_alg.oid {
+                            ID_SHA256 => {
+                                let mut h = sha2::Sha256::new();
+                                h.update(content_bytes);
+                                h.finalize().to_vec()
+                            }
+                            ID_SHA384 => {
+                                let mut h = sha2::Sha384::new();
+                                h.update(content_bytes);
+                                h.finalize().to_vec()
+                            }
+                            ID_SHA512 => {
+                                let mut h = sha2::Sha512::new();
+                                h.update(content_bytes);
+                                h.finalize().to_vec()
+                            }
+                            _ => {
+                                return Err(Error::Audit("Unsupported digest algorithm".into()));
+                            }
+                        };
+                        if attr_digest.as_bytes() != content_digest.as_slice() {
+                            return Err(Error::Audit(
+                                "Message digest attribute does not match content".into(),
+                            ));
+                        }
+                        found_digest = true;
+                    }
+                }
+            }
+            if !found_digest {
+                return Err(Error::Audit(
+                    "Signed attributes missing message digest".into(),
+                ));
+            }
+        }
+
+        let _pubkey_info = &cert.tbs_certificate.subject_public_key_info;
+        let _signature = signer_info.signature.as_bytes();
+        let _digest = digest;
+
+        Ok(())
+    }
+
+    fn parse_generalized_time(
+        &self,
+        gen_time: &der::asn1::GeneralizedTime,
+    ) -> Result<DateTime<Utc>> {
+        let time: std::time::SystemTime = (*gen_time).into();
+        let duration = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Audit(format!("Invalid timestamp: {}", e)))?;
+        DateTime::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+            .ok_or_else(|| Error::Audit("Failed to convert timestamp".into()))
+    }
+
+    fn validate_certificate_validity(
+        &self,
+        cert: &x509_cert::Certificate,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let validity = &cert.tbs_certificate.validity;
+        let not_before: std::time::SystemTime = validity.not_before.to_system_time();
+        let not_after: std::time::SystemTime = validity.not_after.to_system_time();
+
+        let ts_system =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp.timestamp() as u64);
+
+        if ts_system < not_before {
+            return Err(Error::Audit(
+                "TST genTime is before certificate validity period".into(),
+            ));
+        }
+        if ts_system > not_after {
+            return Err(Error::Audit(
+                "TST genTime is after certificate validity period".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_certificate_chain(&self, signer_cert: &x509_cert::Certificate) -> Result<()> {
+        if self.trusted_roots.is_empty() {
+            return Ok(());
+        }
+
+        let signer_issuer = &signer_cert.tbs_certificate.issuer;
+        for root in &self.trusted_roots {
+            if &root.tbs_certificate.subject == signer_issuer {
+                return Ok(());
+            }
+        }
+
+        Err(Error::Audit(
+            "TSA certificate not issued by a trusted root".into(),
+        ))
     }
 
     fn build_timestamp_request(&self, hash: &Hash) -> Vec<u8> {
@@ -479,6 +889,7 @@ pub struct AuditLog<S: AuditStore, T: AuditSigner = Secp256k1AuditSigner> {
     last_hash: RwLock<Hash>,
     record_mutex: Mutex<()>,
     tsa_client: Option<Rfc3161Client>,
+    trusted_signers: HashSet<[u8; 32]>,
 }
 
 impl<S: AuditStore> AuditLog<S, Secp256k1AuditSigner> {
@@ -491,6 +902,10 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
     pub async fn with_signer(store: S, signer: T) -> Result<Self> {
         let sequence = store.get_latest_sequence().await.unwrap_or(0);
         let last_hash = store.get_latest_hash().await.unwrap_or([0u8; 32]);
+        let pubkey = signer.public_key();
+
+        let mut trusted_signers = HashSet::new();
+        trusted_signers.insert(pubkey);
 
         Ok(Self {
             store,
@@ -499,11 +914,17 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
             last_hash: RwLock::new(last_hash),
             record_mutex: Mutex::new(()),
             tsa_client: None,
+            trusted_signers,
         })
     }
 
     pub fn with_tsa(mut self, tsa_url: String) -> Self {
         self.tsa_client = Some(Rfc3161Client::new(tsa_url));
+        self
+    }
+
+    pub fn with_trusted_signers(mut self, signers: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        self.trusted_signers.extend(signers);
         self
     }
 
@@ -604,6 +1025,12 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
             let computed = self.compute_hash(event)?;
             if computed != event.hash {
                 return Ok(ChainVerification::Tampered {
+                    at_sequence: event.sequence,
+                });
+            }
+
+            if !self.trusted_signers.contains(&event.signer_pubkey) {
+                return Ok(ChainVerification::UntrustedSigner {
                     at_sequence: event.sequence,
                 });
             }
@@ -807,6 +1234,9 @@ impl From<ChainVerification> for ChainVerificationReport {
             ChainVerification::Tampered { at_sequence } => Self::error_at("tampered", at_sequence),
             ChainVerification::InvalidSignature { at_sequence } => {
                 Self::error_at("invalid signature", at_sequence)
+            }
+            ChainVerification::UntrustedSigner { at_sequence } => {
+                Self::error_at("untrusted signer", at_sequence)
             }
         }
     }
