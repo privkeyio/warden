@@ -43,47 +43,24 @@ pub struct AuditEvent {
     pub details: Value,
     pub previous_hash: Hash,
     pub hash: Hash,
-    #[serde(with = "signature_serde")]
+    #[serde(with = "hex_serde")]
     pub signature: Signature,
     #[serde(with = "hex_serde")]
     pub signer_pubkey: [u8; 32],
     pub rfc3161_token: Option<Rfc3161Token>,
 }
 
-mod signature_serde {
-    use super::Signature;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(sig: &Signature, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(sig))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Signature, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid signature length"))
-    }
-}
-
 mod hex_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S, const N: usize>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(bytes))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -91,7 +68,7 @@ mod hex_serde {
         let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
         bytes
             .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid pubkey length"))
+            .map_err(|_| serde::de::Error::custom("invalid byte array length"))
     }
 }
 
@@ -474,45 +451,23 @@ impl Rfc3161Client {
         })
     }
 
-    /// Build an RFC 3161 TimeStampReq in ASN.1 DER encoding.
-    ///
-    /// Structure (per RFC 3161):
-    /// ```asn1
-    /// TimeStampReq ::= SEQUENCE {
-    ///    version          INTEGER { v1(1) },
-    ///    messageImprint   MessageImprint,
-    ///    certReq          BOOLEAN DEFAULT FALSE
-    /// }
-    /// MessageImprint ::= SEQUENCE {
-    ///    hashAlgorithm    AlgorithmIdentifier,
-    ///    hashedMessage    OCTET STRING
-    /// }
-    /// AlgorithmIdentifier ::= SEQUENCE {
-    ///    algorithm        OBJECT IDENTIFIER (2.16.840.1.101.3.4.2.1 = SHA-256),
-    ///    parameters       NULL
-    /// }
-    /// ```
     fn build_timestamp_request(&self, hash: &Hash) -> Vec<u8> {
+        #[rustfmt::skip]
+        const ASN1_HEADER: [u8; 24] = [
+            0x30, 0x39,                                                 // SEQUENCE (TimeStampReq), len 57
+            0x02, 0x01, 0x01,                                           // INTEGER version = 1
+            0x30, 0x31,                                                 // SEQUENCE (MessageImprint), len 49
+            0x30, 0x0d,                                                 // SEQUENCE (AlgorithmIdentifier), len 13
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, // OID SHA-256
+            0x05, 0x00,                                                 // NULL parameters
+            0x04, 0x20,                                                 // OCTET STRING, len 32
+        ];
+        const ASN1_FOOTER: [u8; 3] = [0x01, 0x01, 0xff]; // BOOLEAN certReq = TRUE
+
         let mut request = Vec::with_capacity(59);
-        // SEQUENCE (TimeStampReq), length 57
-        request.extend_from_slice(&[0x30, 0x39]);
-        // INTEGER version = 1
-        request.extend_from_slice(&[0x02, 0x01, 0x01]);
-        // SEQUENCE (MessageImprint), length 49
-        request.extend_from_slice(&[0x30, 0x31]);
-        // SEQUENCE (AlgorithmIdentifier), length 13
-        request.extend_from_slice(&[0x30, 0x0d]);
-        // OID 2.16.840.1.101.3.4.2.1 (SHA-256)
-        request.extend_from_slice(&[
-            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-        ]);
-        // NULL parameters
-        request.extend_from_slice(&[0x05, 0x00]);
-        // OCTET STRING (hashedMessage), length 32
-        request.extend_from_slice(&[0x04, 0x20]);
+        request.extend_from_slice(&ASN1_HEADER);
         request.extend_from_slice(hash);
-        // BOOLEAN certReq = TRUE
-        request.extend_from_slice(&[0x01, 0x01, 0xff]);
+        request.extend_from_slice(&ASN1_FOOTER);
         request
     }
 }
@@ -599,27 +554,24 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
     }
 
     fn compute_hash(&self, event: &AuditEvent) -> Result<Hash> {
-        let mut hasher = Sha256::new();
+        fn hash_json<T: Serialize>(hasher: &mut Sha256, value: &T) -> Result<()> {
+            let bytes =
+                serde_json::to_vec(value).map_err(|e| Error::Serialization(e.to_string()))?;
+            hasher.update(&bytes);
+            Ok(())
+        }
 
+        let mut hasher = Sha256::new();
         hasher.update(event.id.as_bytes());
         hasher.update(event.sequence.to_le_bytes());
         hasher.update(event.timestamp.to_rfc3339().as_bytes());
-        let event_type_bytes = serde_json::to_vec(&event.event_type)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        hasher.update(&event_type_bytes);
+        hash_json(&mut hasher, &event.event_type)?;
         if let Some(ref actor) = event.actor {
-            let actor_bytes = serde_json::to_vec(actor)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            hasher.update(&actor_bytes);
+            hash_json(&mut hasher, actor)?;
         }
-        let resource_bytes = serde_json::to_vec(&event.resource)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        hasher.update(&resource_bytes);
-        let details_bytes = serde_json::to_vec(&event.details)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        hasher.update(&details_bytes);
+        hash_json(&mut hasher, &event.resource)?;
+        hash_json(&mut hasher, &event.details)?;
         hasher.update(event.previous_hash);
-
         Ok(hasher.finalize().into())
     }
 
@@ -830,6 +782,16 @@ pub struct ChainVerificationReport {
     pub last_sequence: u64,
 }
 
+impl ChainVerificationReport {
+    fn error_at(kind: &str, at_sequence: u64) -> Self {
+        Self {
+            status: format!("{} at sequence {}", kind, at_sequence),
+            events_checked: 0,
+            last_sequence: at_sequence,
+        }
+    }
+}
+
 impl From<ChainVerification> for ChainVerificationReport {
     fn from(v: ChainVerification) -> Self {
         match v {
@@ -841,21 +803,11 @@ impl From<ChainVerification> for ChainVerificationReport {
                 events_checked,
                 last_sequence,
             },
-            ChainVerification::Broken { at_sequence, .. } => Self {
-                status: format!("broken at sequence {}", at_sequence),
-                events_checked: 0,
-                last_sequence: at_sequence,
-            },
-            ChainVerification::Tampered { at_sequence } => Self {
-                status: format!("tampered at sequence {}", at_sequence),
-                events_checked: 0,
-                last_sequence: at_sequence,
-            },
-            ChainVerification::InvalidSignature { at_sequence } => Self {
-                status: format!("invalid signature at sequence {}", at_sequence),
-                events_checked: 0,
-                last_sequence: at_sequence,
-            },
+            ChainVerification::Broken { at_sequence, .. } => Self::error_at("broken", at_sequence),
+            ChainVerification::Tampered { at_sequence } => Self::error_at("tampered", at_sequence),
+            ChainVerification::InvalidSignature { at_sequence } => {
+                Self::error_at("invalid signature", at_sequence)
+            }
         }
     }
 }
