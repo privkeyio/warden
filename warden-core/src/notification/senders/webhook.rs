@@ -4,10 +4,12 @@ use chrono::Utc;
 use crate::notification::service::{NotificationError, NotificationSender};
 use crate::notification::types::{notification_type_name, Notification};
 use crate::secrets::SecretValue;
+use crate::ssrf::{validate_url, SsrfPolicy};
 
 pub struct WebhookSender {
     client: reqwest::Client,
     default_secret: Option<SecretValue>,
+    ssrf_policy: SsrfPolicy,
 }
 
 impl WebhookSender {
@@ -15,11 +17,17 @@ impl WebhookSender {
         Self {
             client: reqwest::Client::new(),
             default_secret: None,
+            ssrf_policy: SsrfPolicy::strict(),
         }
     }
 
     pub fn with_secret(mut self, secret: impl Into<SecretValue>) -> Self {
         self.default_secret = Some(secret.into());
+        self
+    }
+
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf_policy = policy;
         self
     }
 
@@ -72,11 +80,8 @@ impl NotificationSender for WebhookSender {
     ) -> std::result::Result<(), NotificationError> {
         let (url, secret) = self.parse_recipient(recipient)?;
 
-        if !url.starts_with("https://") {
-            return Err(NotificationError::Permanent(
-                "webhook URL must use HTTPS".into(),
-            ));
-        }
+        validate_url(url, &self.ssrf_policy)
+            .map_err(|e| NotificationError::Permanent(e.to_string()))?;
 
         let secret = secret
             .ok_or_else(|| NotificationError::Permanent("webhook secret not configured".into()))?;

@@ -27,6 +27,7 @@ hmac = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
+url = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
 bitcoin = { workspace = true }

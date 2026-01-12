@@ -18,6 +18,7 @@ pub mod policy;
 pub mod quorum;
 pub mod risk;
 pub mod secrets;
+pub mod ssrf;
 pub mod store;
 pub mod velocity;
 pub mod workflow;
@@ -112,3 +113,4 @@ pub use secrets::{
     EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
     VaultSecretsProvider,
 };
+pub use ssrf::{SsrfError, SsrfPolicy};

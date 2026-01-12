@@ -2,6 +2,7 @@
 
 use crate::callback::{CallbackDecision, CallbackRequest, CallbackResponse};
 use crate::secrets::SecretValue;
+use crate::ssrf::{validate_url, SsrfError, SsrfPolicy};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -62,6 +63,14 @@ pub enum ComplianceError {
     Timeout,
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
+    #[error("SSRF validation failed: {0}")]
+    SsrfBlocked(String),
+}
+
+impl From<SsrfError> for ComplianceError {
+    fn from(err: SsrfError) -> Self {
+        ComplianceError::SsrfBlocked(err.to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -112,7 +121,15 @@ pub struct ChainalysisClient {
 }
 
 impl ChainalysisClient {
-    pub fn new(config: ChainalysisConfig) -> Self {
+    pub fn new(config: ChainalysisConfig) -> Result<Self, ComplianceError> {
+        validate_url(&config.base_url, &SsrfPolicy::strict())?;
+        Ok(Self {
+            config,
+            http_client: reqwest::Client::new(),
+        })
+    }
+
+    pub fn new_unchecked(config: ChainalysisConfig) -> Self {
         Self {
             config,
             http_client: reqwest::Client::new(),
@@ -349,6 +366,21 @@ const HMAC_MIN_KEY_LENGTH: usize = 32;
 
 impl EllipticClient {
     pub fn new(config: EllipticConfig) -> std::result::Result<Self, ComplianceError> {
+        validate_url(&config.base_url, &SsrfPolicy::strict())?;
+        let key_len = config.api_secret.expose().len();
+        if key_len < HMAC_MIN_KEY_LENGTH {
+            return Err(ComplianceError::ConfigurationError(format!(
+                "HMAC key must be at least {} bytes, got {}",
+                HMAC_MIN_KEY_LENGTH, key_len
+            )));
+        }
+        Ok(Self {
+            config,
+            http_client: reqwest::Client::new(),
+        })
+    }
+
+    pub fn new_unchecked(config: EllipticConfig) -> std::result::Result<Self, ComplianceError> {
         let key_len = config.api_secret.expose().len();
         if key_len < HMAC_MIN_KEY_LENGTH {
             return Err(ComplianceError::ConfigurationError(format!(
@@ -653,7 +685,7 @@ mod tests {
             base_url: "https://api.elliptic.co".into(),
             timeout_seconds: 30,
         };
-        let result = EllipticClient::new(config);
+        let result = EllipticClient::new_unchecked(config);
         assert!(matches!(
             result,
             Err(ComplianceError::ConfigurationError(_))
@@ -669,7 +701,31 @@ mod tests {
             base_url: "https://api.elliptic.co".into(),
             timeout_seconds: 30,
         };
-        let result = EllipticClient::new(config);
+        let result = EllipticClient::new_unchecked(config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_chainalysis_client_rejects_private_ip() {
+        let config = ChainalysisConfig {
+            api_key: "test-key".into(),
+            base_url: "https://localhost/api".into(),
+            timeout_seconds: 30,
+        };
+        let result = ChainalysisClient::new(config);
+        assert!(matches!(result, Err(ComplianceError::SsrfBlocked(_))));
+    }
+
+    #[test]
+    fn test_elliptic_client_rejects_private_ip() {
+        let valid_key = "a".repeat(HMAC_MIN_KEY_LENGTH);
+        let config = EllipticConfig {
+            api_key: "test-key".into(),
+            api_secret: valid_key.into(),
+            base_url: "https://localhost/api".into(),
+            timeout_seconds: 30,
+        };
+        let result = EllipticClient::new(config);
+        assert!(matches!(result, Err(ComplianceError::SsrfBlocked(_))));
     }
 }
