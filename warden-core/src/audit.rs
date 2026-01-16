@@ -581,7 +581,7 @@ impl Rfc3161Client {
             self.validate_timestamp_response_with_chain(response_bytes, expected_hash)?;
 
         if !self.trusted_roots.is_empty() {
-            self.validate_certificate_chain(&signer_cert, &chain_certs)?;
+            self.validate_certificate_chain(&signer_cert, &chain_certs, gen_time)?;
         }
 
         Ok((gen_time, signer_cert))
@@ -722,8 +722,13 @@ impl Rfc3161Client {
                     .as_ref()
                     .is_some_and(|exts| {
                         exts.iter().any(|ext| {
-                            ext.extn_id == oid::SUBJECT_KEY_ID
-                                && ext.extn_value.as_bytes() == skid.0.as_bytes()
+                            if ext.extn_id != oid::SUBJECT_KEY_ID {
+                                return false;
+                            }
+                            // Decode the DER-encoded OCTET STRING to get the actual SKID bytes
+                            der::asn1::OctetString::from_der(ext.extn_value.as_bytes())
+                                .map(|decoded| decoded.as_bytes() == skid.0.as_bytes())
+                                .unwrap_or(false)
                         })
                     }),
             };
@@ -790,7 +795,7 @@ impl Rfc3161Client {
         let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
 
         if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
-            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg)?;
+            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg, &signer_info.digest_alg.oid)?;
         } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
@@ -864,6 +869,7 @@ impl Rfc3161Client {
         digest: &[u8],
         signature: &[u8],
         sig_alg: &der::oid::ObjectIdentifier,
+        digest_alg: &der::oid::ObjectIdentifier,
     ) -> Result<()> {
         use der::Decode;
         use rsa::{pkcs1v15::Pkcs1v15Sign, RsaPublicKey};
@@ -876,8 +882,21 @@ impl Rfc3161Client {
         )
         .map_err(|e| Error::Audit(format!("Invalid RSA public key: {}", e)))?;
 
+        // When sig_alg is RSA_ENCRYPTION (key algorithm, not signature algorithm),
+        // use the digest algorithm to determine the PKCS#1v15 scheme
         let scheme = match *sig_alg {
-            oid::RSA_ENCRYPTION | oid::RSA_SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
+            oid::RSA_ENCRYPTION => match *digest_alg {
+                oid::SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
+                oid::SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
+                oid::SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
+                _ => {
+                    return Err(Error::Audit(format!(
+                        "Unsupported digest algorithm for RSA signature: {}",
+                        digest_alg
+                    )));
+                }
+            },
+            oid::RSA_SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
             oid::RSA_SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
             oid::RSA_SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
             _ => {
@@ -972,6 +991,7 @@ impl Rfc3161Client {
         &self,
         signer_cert: &x509_cert::Certificate,
         chain_certs: &[x509_cert::Certificate],
+        gen_time: DateTime<Utc>,
     ) -> Result<()> {
         if self.trusted_roots.is_empty() {
             return Ok(());
@@ -986,6 +1006,9 @@ impl Rfc3161Client {
             let is_end_entity = i == 0;
             let is_root = i == chain_len - 1;
             let is_ca = !is_end_entity;
+
+            // Validate certificate validity (notBefore/notAfter) against genTime
+            self.validate_certificate_validity(cert, gen_time)?;
 
             if is_ca {
                 self.validate_basic_constraints(cert, !is_root)?;
@@ -1181,10 +1204,10 @@ impl Rfc3161Client {
         let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
 
         if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
-            let digest = match *sig_alg {
-                oid::RSA_SHA256 => sha2::Sha256::digest(&tbs_bytes).to_vec(),
-                oid::RSA_SHA384 => sha2::Sha384::digest(&tbs_bytes).to_vec(),
-                oid::RSA_SHA512 => sha2::Sha512::digest(&tbs_bytes).to_vec(),
+            let (digest, digest_alg) = match *sig_alg {
+                oid::RSA_SHA256 => (sha2::Sha256::digest(&tbs_bytes).to_vec(), oid::SHA256),
+                oid::RSA_SHA384 => (sha2::Sha384::digest(&tbs_bytes).to_vec(), oid::SHA384),
+                oid::RSA_SHA512 => (sha2::Sha512::digest(&tbs_bytes).to_vec(), oid::SHA512),
                 _ => {
                     return Err(Error::Audit(format!(
                         "Unsupported certificate signature algorithm: {}",
@@ -1192,7 +1215,7 @@ impl Rfc3161Client {
                     )));
                 }
             };
-            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg)?;
+            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg, &digest_alg)?;
         } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
