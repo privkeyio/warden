@@ -18,12 +18,6 @@ pub enum Error {
     #[error("evaluation error: {0}")]
     Evaluation(String),
 
-    #[error("max recursion depth exceeded: {0}")]
-    MaxDepthExceeded(usize),
-
-    #[error("stack overflow protection triggered")]
-    StackOverflow,
-
     #[error("address list not found: {0}")]
     AddressListNotFound(String),
 

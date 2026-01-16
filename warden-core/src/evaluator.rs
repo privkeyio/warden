@@ -12,68 +12,31 @@ use crate::policy::{Action, ApprovalConfig, PolicyDecision, Rule};
 use crate::store::{AddressListStore, PolicyStore};
 use crate::{Error, Result};
 
-const MAX_RECURSION_DEPTH: usize = 64;
-const REQUIRED_STACK_SPACE: usize = 1024 * 100;
+const MAX_RULES_PER_EVALUATION: usize = 256;
 
-pub struct DepthTracker {
-    depth: usize,
-    max_depth: usize,
+struct EvaluationLimiter {
+    rules_evaluated: usize,
+    max_rules: usize,
 }
 
-impl DepthTracker {
-    pub fn new() -> Self {
+impl EvaluationLimiter {
+    fn new(max_rules: usize) -> Self {
         Self {
-            depth: 0,
-            max_depth: MAX_RECURSION_DEPTH,
+            rules_evaluated: 0,
+            max_rules,
         }
     }
 
-    pub fn with_max_depth(max_depth: usize) -> Self {
-        Self {
-            depth: 0,
-            max_depth,
+    fn check_rule(&mut self) -> Result<()> {
+        self.rules_evaluated += 1;
+        if self.rules_evaluated > self.max_rules {
+            return Err(Error::Evaluation(format!(
+                "evaluation limit exceeded: evaluated {} rules (max {})",
+                self.rules_evaluated, self.max_rules
+            )));
         }
+        Ok(())
     }
-
-    pub fn enter(&mut self) -> Result<DepthGuard<'_>> {
-        self.depth += 1;
-
-        if self.depth > self.max_depth {
-            self.depth -= 1;
-            return Err(Error::MaxDepthExceeded(self.max_depth));
-        }
-
-        if !has_stack_space(REQUIRED_STACK_SPACE) {
-            self.depth -= 1;
-            return Err(Error::StackOverflow);
-        }
-
-        Ok(DepthGuard { tracker: self })
-    }
-
-    pub fn current_depth(&self) -> usize {
-        self.depth
-    }
-}
-
-impl Default for DepthTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct DepthGuard<'a> {
-    tracker: &'a mut DepthTracker,
-}
-
-impl Drop for DepthGuard<'_> {
-    fn drop(&mut self) {
-        self.tracker.depth -= 1;
-    }
-}
-
-fn has_stack_space(_required: usize) -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,7 +150,7 @@ pub struct PolicyEvaluator {
     policy_store: Arc<dyn PolicyStore>,
     whitelist_store: Arc<dyn AddressListStore>,
     blacklist_store: Arc<dyn AddressListStore>,
-    max_depth: usize,
+    max_rules: usize,
 }
 
 impl PolicyEvaluator {
@@ -200,19 +163,19 @@ impl PolicyEvaluator {
             policy_store,
             whitelist_store,
             blacklist_store,
-            max_depth: MAX_RECURSION_DEPTH,
+            max_rules: MAX_RULES_PER_EVALUATION,
         }
     }
 
-    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
-        self.max_depth = max_depth;
+    pub fn with_max_rules(mut self, max_rules: usize) -> Self {
+        self.max_rules = max_rules;
         self
     }
 
     pub async fn evaluate(&self, request: &TransactionRequest) -> Result<EvaluationResult> {
         let start = Instant::now();
         let mut trace = Vec::new();
-        let mut depth_tracker = DepthTracker::with_max_depth(self.max_depth);
+        let mut limiter = EvaluationLimiter::new(self.max_rules);
 
         let policy = self
             .policy_store
@@ -227,9 +190,8 @@ impl PolicyEvaluator {
         );
 
         for rule in &policy.rules {
-            let match_result = self
-                .evaluate_rule(rule, &context, &mut depth_tracker)
-                .await?;
+            limiter.check_rule()?;
+            let match_result = self.evaluate_rule(rule, &context).await?;
 
             trace.push(RuleTraceEntry {
                 rule_id: rule.id.clone(),
@@ -267,10 +229,7 @@ impl PolicyEvaluator {
         &self,
         rule: &Rule,
         context: &EvaluationContext<'_>,
-        depth_tracker: &mut DepthTracker,
     ) -> Result<MatchResult> {
-        let _guard = depth_tracker.enter()?;
-
         if rule.conditions.is_empty() {
             return Ok(MatchResult::Match("empty conditions (matches all)".into()));
         }
@@ -436,5 +395,24 @@ mod tests {
         let tx = TransactionRequest::new("treasury-hot-1".into(), "bc1qtest".into(), 1_000_000);
         assert_eq!(tx.source_wallet, "treasury-hot-1");
         assert_eq!(tx.amount_sats, 1_000_000);
+    }
+
+    #[test]
+    fn test_evaluation_limiter_allows_within_limit() {
+        let mut limiter = EvaluationLimiter::new(3);
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+    }
+
+    #[test]
+    fn test_evaluation_limiter_blocks_over_limit() {
+        let mut limiter = EvaluationLimiter::new(2);
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+        let err = limiter.check_rule().unwrap_err();
+        assert!(err.to_string().contains("evaluation limit exceeded"));
+        assert!(err.to_string().contains("3 rules"));
+        assert!(err.to_string().contains("max 2"));
     }
 }
