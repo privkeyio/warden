@@ -18,6 +18,15 @@ pub enum WindowType {
     Monthly,
 }
 
+impl WindowType {
+    pub const ALL: [WindowType; 4] = [
+        WindowType::Hourly,
+        WindowType::Daily,
+        WindowType::Weekly,
+        WindowType::Monthly,
+    ];
+}
+
 impl std::fmt::Display for WindowType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -60,6 +69,25 @@ pub struct VelocityCheck {
     pub limit_sats: u64,
     pub would_be_sats: u64,
     pub utilization: f64,
+}
+
+impl VelocityCheck {
+    fn new(window_type: WindowType, current_sats: u64, limit_sats: u64, amount_sats: u64) -> Self {
+        let would_be_sats = current_sats.saturating_add(amount_sats);
+        let utilization = if limit_sats == 0 {
+            0.0
+        } else {
+            would_be_sats as f64 / limit_sats as f64
+        };
+        Self {
+            window_type,
+            allowed: would_be_sats <= limit_sats,
+            current_sats,
+            limit_sats,
+            would_be_sats,
+            utilization,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +135,7 @@ pub trait VelocityStore: Send + Sync {
         window_type: WindowType,
         path: Option<&str>,
         amount_sats: u64,
+        limits: &VelocityLimits,
     ) -> Result<VelocityWindow>;
 
     async fn get_all_windows(
@@ -114,6 +143,14 @@ pub trait VelocityStore: Send + Sync {
         user_id: &str,
         path: Option<&str>,
     ) -> Result<HashMap<WindowType, VelocityWindow>>;
+
+    async fn atomic_check_and_update(
+        &self,
+        user_id: &str,
+        amount_sats: u64,
+        path: Option<&str>,
+        limits: &VelocityLimits,
+    ) -> Result<Vec<VelocityCheck>>;
 }
 
 pub struct VelocityTracker<S: VelocityStore> {
@@ -132,31 +169,13 @@ impl<S: VelocityStore> VelocityTracker<S> {
         amount_sats: u64,
         path: Option<&str>,
     ) -> Result<Vec<VelocityCheck>> {
-        let mut checks = Vec::new();
+        let mut checks = Vec::with_capacity(WindowType::ALL.len());
 
-        for window_type in [
-            WindowType::Hourly,
-            WindowType::Daily,
-            WindowType::Weekly,
-            WindowType::Monthly,
-        ] {
+        for window_type in WindowType::ALL {
             let window = self.store.get_window(user_id, window_type, path).await?;
             let current = window.map(|w| w.used_sats).unwrap_or(0);
             let limit = self.limits.get(window_type);
-            let would_be = current + amount_sats;
-
-            checks.push(VelocityCheck {
-                window_type,
-                allowed: would_be <= limit,
-                current_sats: current,
-                limit_sats: limit,
-                would_be_sats: would_be,
-                utilization: if limit == 0 {
-                    0.0
-                } else {
-                    would_be as f64 / limit as f64
-                },
-            });
+            checks.push(VelocityCheck::new(window_type, current, limit, amount_sats));
         }
 
         Ok(checks)
@@ -168,22 +187,9 @@ impl<S: VelocityStore> VelocityTracker<S> {
         amount_sats: u64,
         path: Option<&str>,
     ) -> Result<Vec<VelocityCheck>> {
-        let checks = self.check(user_id, amount_sats, path).await?;
-
-        if checks.iter().all(|c| c.allowed) {
-            for window_type in [
-                WindowType::Hourly,
-                WindowType::Daily,
-                WindowType::Weekly,
-                WindowType::Monthly,
-            ] {
-                self.store
-                    .update_window(user_id, window_type, path, amount_sats)
-                    .await?;
-            }
-        }
-
-        Ok(checks)
+        self.store
+            .atomic_check_and_update(user_id, amount_sats, path, &self.limits)
+            .await
     }
 
     pub async fn get_utilizations(
@@ -192,21 +198,13 @@ impl<S: VelocityStore> VelocityTracker<S> {
         path: Option<&str>,
     ) -> Result<HashMap<WindowType, f64>> {
         let windows = self.store.get_all_windows(user_id, path).await?;
-        let mut utilizations = HashMap::new();
-
-        for window_type in [
-            WindowType::Hourly,
-            WindowType::Daily,
-            WindowType::Weekly,
-            WindowType::Monthly,
-        ] {
-            let util = windows
-                .get(&window_type)
-                .map(|w| w.utilization())
-                .unwrap_or(0.0);
-            utilizations.insert(window_type, util);
-        }
-
+        let utilizations = WindowType::ALL
+            .into_iter()
+            .map(|wt| {
+                let util = windows.get(&wt).map(|w| w.utilization()).unwrap_or(0.0);
+                (wt, util)
+            })
+            .collect();
         Ok(utilizations)
     }
 
@@ -218,15 +216,19 @@ impl<S: VelocityStore> VelocityTracker<S> {
 
 pub struct InMemoryVelocityStore {
     windows: Arc<RwLock<HashMap<String, VelocityWindow>>>,
-    limits: VelocityLimits,
+}
+
+impl Default for InMemoryVelocityStore {
+    fn default() -> Self {
+        Self {
+            windows: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 impl InMemoryVelocityStore {
-    pub fn new(limits: VelocityLimits) -> Self {
-        Self {
-            windows: Arc::new(RwLock::new(HashMap::new())),
-            limits,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     fn make_key(user_id: &str, window_type: WindowType, path: Option<&str>) -> String {
@@ -314,10 +316,11 @@ impl VelocityStore for InMemoryVelocityStore {
         window_type: WindowType,
         path: Option<&str>,
         amount_sats: u64,
+        limits: &VelocityLimits,
     ) -> Result<VelocityWindow> {
         let key = Self::make_key(user_id, window_type, path);
         let (window_start, window_end) = Self::calculate_bounds(window_type);
-        let limit = self.limits.get(window_type);
+        let limit = limits.get(window_type);
 
         let mut windows = self.windows.write().await;
         let window = windows.entry(key).or_insert_with(|| VelocityWindow {
@@ -329,8 +332,8 @@ impl VelocityStore for InMemoryVelocityStore {
             window_end,
         });
 
-        window.used_sats += amount_sats;
-        window.transaction_count += 1;
+        window.used_sats = window.used_sats.saturating_add(amount_sats);
+        window.transaction_count = window.transaction_count.saturating_add(1);
 
         Ok(window.clone())
     }
@@ -340,20 +343,61 @@ impl VelocityStore for InMemoryVelocityStore {
         user_id: &str,
         path: Option<&str>,
     ) -> Result<HashMap<WindowType, VelocityWindow>> {
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(WindowType::ALL.len());
 
-        for window_type in [
-            WindowType::Hourly,
-            WindowType::Daily,
-            WindowType::Weekly,
-            WindowType::Monthly,
-        ] {
+        for window_type in WindowType::ALL {
             if let Some(window) = self.get_window(user_id, window_type, path).await? {
                 result.insert(window_type, window);
             }
         }
 
         Ok(result)
+    }
+
+    async fn atomic_check_and_update(
+        &self,
+        user_id: &str,
+        amount_sats: u64,
+        path: Option<&str>,
+        limits: &VelocityLimits,
+    ) -> Result<Vec<VelocityCheck>> {
+        let mut windows = self.windows.write().await;
+
+        let window_data: Vec<_> = WindowType::ALL
+            .into_iter()
+            .map(|window_type| {
+                let key = Self::make_key(user_id, window_type, path);
+                let (window_start, window_end) = Self::calculate_bounds(window_type);
+                let limit = limits.get(window_type);
+                (window_type, key, window_start, window_end, limit)
+            })
+            .collect();
+
+        let checks: Vec<_> = window_data
+            .iter()
+            .map(|(window_type, key, _, _, limit)| {
+                let current = windows.get(key).map(|w| w.used_sats).unwrap_or(0);
+                VelocityCheck::new(*window_type, current, *limit, amount_sats)
+            })
+            .collect();
+
+        if checks.iter().all(|c| c.allowed) {
+            for (window_type, key, window_start, window_end, limit) in window_data {
+                let window = windows.entry(key).or_insert_with(|| VelocityWindow {
+                    window_type,
+                    used_sats: 0,
+                    limit_sats: limit,
+                    transaction_count: 0,
+                    window_start,
+                    window_end,
+                });
+
+                window.used_sats = window.used_sats.saturating_add(amount_sats);
+                window.transaction_count = window.transaction_count.saturating_add(1);
+            }
+        }
+
+        Ok(checks)
     }
 }
 
@@ -369,22 +413,21 @@ mod tests {
             weekly_sats: 1_000_000,
             monthly_sats: 5_000_000,
         };
-        let store = InMemoryVelocityStore::new(limits.clone());
+        let store = InMemoryVelocityStore::new();
         let tracker = VelocityTracker::new(store, limits);
 
         let checks = tracker.check("user1", 50_000, None).await.unwrap();
         assert!(checks.iter().all(|c| c.allowed));
 
         let checks = tracker.check("user1", 200_000, None).await.unwrap();
-        assert!(!checks[0].allowed); // hourly exceeded
-        assert!(checks[1].allowed); // daily ok
+        assert!(!checks[0].allowed);
+        assert!(checks[1].allowed);
     }
 
     #[tokio::test]
     async fn test_velocity_update() {
-        let limits = VelocityLimits::default();
-        let store = InMemoryVelocityStore::new(limits.clone());
-        let tracker = VelocityTracker::new(store, limits);
+        let store = InMemoryVelocityStore::new();
+        let tracker = VelocityTracker::new(store, VelocityLimits::default());
 
         tracker
             .check_and_update("user1", 10_000_000, None)

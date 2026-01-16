@@ -5,10 +5,11 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
+use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -352,7 +353,7 @@ impl CipherOps for RedbPolicyStore {
 
 impl RedbPolicyStore {
     fn find_matching_binding(&self, wallet_id: &str) -> Option<Uuid> {
-        let cache = self.pattern_cache.read().expect("lock poisoned");
+        let cache = self.pattern_cache.read();
         for (pattern, policy_id) in cache.iter() {
             if matches_pattern(pattern, wallet_id) {
                 return Some(*policy_id);
@@ -372,7 +373,7 @@ impl RedbPolicyStore {
             patterns.push((pattern.value().to_string(), uuid));
         }
 
-        let mut cache = self.pattern_cache.write().expect("lock poisoned");
+        let mut cache = self.pattern_cache.write();
         *cache = patterns;
         Ok(())
     }

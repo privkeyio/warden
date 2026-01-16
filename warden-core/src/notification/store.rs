@@ -1,8 +1,8 @@
 //! Notification storage.
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use uuid::Uuid;
 
 use super::types::{NotificationRecord, NotificationStatus};
@@ -38,7 +38,7 @@ impl Default for InMemoryNotificationStore {
 #[async_trait]
 impl NotificationStore for InMemoryNotificationStore {
     async fn save_record(&self, record: NotificationRecord) -> Result<NotificationRecord> {
-        let mut records = self.records.write().expect("lock poisoned");
+        let mut records = self.records.write();
         records.insert(record.id, record.clone());
         Ok(record)
     }
@@ -47,7 +47,7 @@ impl NotificationStore for InMemoryNotificationStore {
         &self,
         workflow_id: &Uuid,
     ) -> Result<Vec<NotificationRecord>> {
-        let records = self.records.read().expect("lock poisoned");
+        let records = self.records.read();
         Ok(records
             .values()
             .filter(|r| &r.workflow_id == workflow_id)
@@ -56,13 +56,13 @@ impl NotificationStore for InMemoryNotificationStore {
     }
 
     async fn update_record(&self, record: NotificationRecord) -> Result<NotificationRecord> {
-        let mut records = self.records.write().expect("lock poisoned");
+        let mut records = self.records.write();
         records.insert(record.id, record.clone());
         Ok(record)
     }
 
     async fn list_pending(&self) -> Result<Vec<NotificationRecord>> {
-        let records = self.records.read().expect("lock poisoned");
+        let records = self.records.read();
         Ok(records
             .values()
             .filter(|r| r.status == NotificationStatus::Pending)
