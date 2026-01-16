@@ -641,8 +641,12 @@ mod tests {
         )));
         assert!(!ClassifyError::is_retryable(&CallbackError::JtiMismatch));
         assert!(!ClassifyError::is_retryable(&CallbackError::JtiReplay));
-        assert!(!ClassifyError::is_retryable(&CallbackError::InvalidAudience));
-        assert!(!ClassifyError::is_retryable(&CallbackError::InvalidSignature));
+        assert!(!ClassifyError::is_retryable(
+            &CallbackError::InvalidAudience
+        ));
+        assert!(!ClassifyError::is_retryable(
+            &CallbackError::InvalidSignature
+        ));
     }
 
     #[test]

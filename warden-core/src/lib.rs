@@ -33,8 +33,8 @@ pub use approval::{
 #[cfg(any(test, feature = "mock"))]
 pub use backend::MockSigningBackend;
 pub use backend::{
-    BackendRegistry, HealthStatus, RetryingSigningBackend, SessionId, SessionStatus, SigningBackend,
-    SigningPayload, SigningRequest, SigningSession, StubKeepBackend,
+    BackendRegistry, HealthStatus, RetryingSigningBackend, SessionId, SessionStatus,
+    SigningBackend, SigningPayload, SigningRequest, SigningSession, StubKeepBackend,
 };
 pub use config::Config;
 pub use error::{Error, Result};

@@ -709,7 +709,10 @@ impl<P: ComplianceProvider> ComplianceProvider for RetryingComplianceProvider<P>
         amount_btc: f64,
     ) -> std::result::Result<(), ComplianceError> {
         self.retry_policy
-            .execute(|| self.inner.register_transfer(tx_hash, output_address, amount_btc))
+            .execute(|| {
+                self.inner
+                    .register_transfer(tx_hash, output_address, amount_btc)
+            })
             .await
     }
 

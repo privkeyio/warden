@@ -47,8 +47,8 @@ impl RetryPolicy {
             return None;
         }
 
-        let base = self.initial_interval.as_secs_f64()
-            * self.backoff_coefficient.powi(attempt as i32);
+        let base =
+            self.initial_interval.as_secs_f64() * self.backoff_coefficient.powi(attempt as i32);
         let capped = base.min(self.maximum_interval.as_secs_f64());
 
         let jittered = self.apply_jitter(capped);
