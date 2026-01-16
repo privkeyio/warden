@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 
 pub type Hash = [u8; 32];
 
@@ -542,7 +543,7 @@ impl BundleSigner for MockBundleSigner {
 
     async fn verify(&self, payload: &[u8], signature: &[u8], signer_id: &str) -> Result<bool> {
         let expected = self.sign(payload, signer_id).await?;
-        Ok(expected == signature)
+        Ok(bool::from(expected.ct_eq(signature)))
     }
 
     fn get_signer_ids(&self) -> Vec<String> {
