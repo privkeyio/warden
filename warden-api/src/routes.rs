@@ -85,6 +85,14 @@ fn api_v1() -> Router<AppState> {
         .nest("/groups", group_routes())
         .nest("/whitelists", whitelist_routes())
         .nest("/blacklists", blacklist_routes())
+        .nest("/tokens", token_routes())
+}
+
+fn token_routes() -> Router<AppState> {
+    Router::new()
+        .route("/revoke", post(handlers::revoke_token))
+        .route("/blacklist/cleanup", post(handlers::cleanup_blacklist))
+        .route("/blacklist/stats", get(handlers::get_blacklist_stats))
 }
 
 fn policy_routes() -> Router<AppState> {

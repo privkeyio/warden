@@ -5,6 +5,7 @@ mod approval;
 mod group;
 mod health;
 mod policy;
+mod token;
 
 pub use address_list::{
     add_blacklist_address, add_whitelist_address, create_blacklist, create_whitelist,
@@ -22,6 +23,7 @@ pub use policy::{
     activate_policy, create_policy, deactivate_policy, delete_policy, evaluate_policy, get_policy,
     list_policies, update_policy,
 };
+pub use token::{cleanup_blacklist, get_blacklist_stats, revoke_token};
 
 use axum::{http::StatusCode, Json};
 use serde::Serialize;
