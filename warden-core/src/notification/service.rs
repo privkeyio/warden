@@ -75,7 +75,7 @@ pub trait NotificationSender: Send + Sync {
 }
 
 pub struct NotificationService {
-    senders: HashMap<String, Arc<dyn NotificationSender>>,
+    senders: Arc<RwLock<HashMap<String, Arc<dyn NotificationSender>>>>,
     retry_policy: RetryPolicy,
     records: RwLock<Vec<NotificationRecord>>,
 }
@@ -83,7 +83,7 @@ pub struct NotificationService {
 impl NotificationService {
     pub fn new() -> Self {
         Self {
-            senders: HashMap::new(),
+            senders: Arc::new(RwLock::new(HashMap::new())),
             retry_policy: RetryPolicy::default(),
             records: RwLock::new(Vec::new()),
         }
@@ -94,8 +94,10 @@ impl NotificationService {
         self
     }
 
-    pub fn register_sender(&mut self, sender: Arc<dyn NotificationSender>) {
+    pub async fn register_sender(&self, sender: Arc<dyn NotificationSender>) {
         self.senders
+            .write()
+            .await
             .insert(sender.channel_type().to_string(), sender);
     }
 
@@ -106,10 +108,12 @@ impl NotificationService {
         recipient: &str,
         workflow_id: Uuid,
     ) -> std::result::Result<NotificationRecord, NotificationError> {
-        let sender = self
-            .senders
+        let senders = self.senders.read().await;
+        let sender = senders
             .get(channel)
+            .cloned()
             .ok_or_else(|| NotificationError::ChannelNotConfigured(channel.into()))?;
+        drop(senders);
 
         let mut record = NotificationRecord {
             id: Uuid::new_v4(),

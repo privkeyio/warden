@@ -12,6 +12,67 @@ use crate::policy::{Action, ApprovalConfig, PolicyDecision, Rule};
 use crate::store::{AddressListStore, PolicyStore};
 use crate::{Error, Result};
 
+const MAX_RECURSION_DEPTH: usize = 64;
+const REQUIRED_STACK_SPACE: usize = 1024 * 100;
+
+pub struct DepthTracker {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl DepthTracker {
+    pub fn new() -> Self {
+        Self {
+            depth: 0,
+            max_depth: MAX_RECURSION_DEPTH,
+        }
+    }
+
+    pub fn with_max_depth(max_depth: usize) -> Self {
+        Self { depth: 0, max_depth }
+    }
+
+    pub fn enter(&mut self) -> Result<DepthGuard<'_>> {
+        self.depth += 1;
+
+        if self.depth > self.max_depth {
+            self.depth -= 1;
+            return Err(Error::MaxDepthExceeded(self.max_depth));
+        }
+
+        if !has_stack_space(REQUIRED_STACK_SPACE) {
+            self.depth -= 1;
+            return Err(Error::StackOverflow);
+        }
+
+        Ok(DepthGuard { tracker: self })
+    }
+
+    pub fn current_depth(&self) -> usize {
+        self.depth
+    }
+}
+
+impl Default for DepthTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct DepthGuard<'a> {
+    tracker: &'a mut DepthTracker,
+}
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.depth -= 1;
+    }
+}
+
+fn has_stack_space(_required: usize) -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionRequest {
     pub id: Uuid,
@@ -123,6 +184,7 @@ pub struct PolicyEvaluator {
     policy_store: Arc<dyn PolicyStore>,
     whitelist_store: Arc<dyn AddressListStore>,
     blacklist_store: Arc<dyn AddressListStore>,
+    max_depth: usize,
 }
 
 impl PolicyEvaluator {
@@ -135,12 +197,19 @@ impl PolicyEvaluator {
             policy_store,
             whitelist_store,
             blacklist_store,
+            max_depth: MAX_RECURSION_DEPTH,
         }
+    }
+
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     pub async fn evaluate(&self, request: &TransactionRequest) -> Result<EvaluationResult> {
         let start = Instant::now();
         let mut trace = Vec::new();
+        let mut depth_tracker = DepthTracker::with_max_depth(self.max_depth);
 
         let policy = self
             .policy_store
@@ -155,7 +224,7 @@ impl PolicyEvaluator {
         );
 
         for rule in &policy.rules {
-            let match_result = self.evaluate_rule(rule, &context).await?;
+            let match_result = self.evaluate_rule(rule, &context, &mut depth_tracker).await?;
 
             trace.push(RuleTraceEntry {
                 rule_id: rule.id.clone(),
@@ -193,7 +262,10 @@ impl PolicyEvaluator {
         &self,
         rule: &Rule,
         context: &EvaluationContext<'_>,
+        depth_tracker: &mut DepthTracker,
     ) -> Result<MatchResult> {
+        let _guard = depth_tracker.enter()?;
+
         if rule.conditions.is_empty() {
             return Ok(MatchResult::Match("empty conditions (matches all)".into()));
         }
