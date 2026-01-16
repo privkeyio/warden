@@ -795,7 +795,13 @@ impl Rfc3161Client {
         let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
 
         if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
-            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg, &signer_info.digest_alg.oid)?;
+            self.verify_rsa_signature(
+                pubkey_bytes,
+                &digest,
+                signature_bytes,
+                sig_alg,
+                &signer_info.digest_alg.oid,
+            )?;
         } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
@@ -1215,7 +1221,13 @@ impl Rfc3161Client {
                     )));
                 }
             };
-            self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg, &digest_alg)?;
+            self.verify_rsa_signature(
+                pubkey_bytes,
+                &digest,
+                signature_bytes,
+                sig_alg,
+                &digest_alg,
+            )?;
         } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
