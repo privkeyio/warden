@@ -10,12 +10,15 @@ use governor::{
     Quota, RateLimiter,
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     num::NonZeroU32,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 #[derive(Serialize)]
 struct AuthErrorResponse {
@@ -41,12 +44,19 @@ impl Role {
     }
 }
 
+pub const DEFAULT_ISSUER: &str = "warden";
+pub const DEFAULT_AUDIENCE: &str = "warden-api";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
+    pub jti: String,
     pub sub: String,
+    pub iss: String,
+    pub aud: String,
     pub role: Role,
-    pub exp: u64,
     pub iat: u64,
+    pub nbf: u64,
+    pub exp: u64,
 }
 
 impl Claims {
@@ -56,11 +66,20 @@ impl Claims {
             .unwrap()
             .as_secs();
         Self {
+            jti: Uuid::new_v4().to_string(),
             sub: subject,
+            iss: DEFAULT_ISSUER.to_string(),
+            aud: DEFAULT_AUDIENCE.to_string(),
             role,
             iat: now,
+            nbf: now,
             exp: now + expires_in.as_secs(),
         }
+    }
+
+    pub fn with_audience(mut self, audience: &str) -> Self {
+        self.aud = audience.to_string();
+        self
     }
 }
 
@@ -73,8 +92,15 @@ pub struct JwtConfig {
 
 impl JwtConfig {
     pub fn new(secret: &[u8]) -> Self {
+        Self::with_audience(secret, DEFAULT_AUDIENCE)
+    }
+
+    pub fn with_audience(secret: &[u8], audience: &str) -> Self {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.set_issuer(&[DEFAULT_ISSUER]);
+        validation.set_audience(&[audience]);
         validation.leeway = 30;
         Self {
             encoding_key: EncodingKey::from_secret(secret),
@@ -97,6 +123,7 @@ pub enum AuthError {
     MissingToken,
     InvalidToken,
     ExpiredToken,
+    ReplayedToken,
     InsufficientPermissions,
     RateLimited,
     InternalError,
@@ -119,6 +146,11 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "EXPIRED_TOKEN",
                 "Token has expired",
+            ),
+            AuthError::ReplayedToken => (
+                StatusCode::UNAUTHORIZED,
+                "REPLAYED_TOKEN",
+                "Token has already been used",
             ),
             AuthError::InsufficientPermissions => (
                 StatusCode::FORBIDDEN,
@@ -182,6 +214,8 @@ where
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::ExpiredToken,
                 _ => AuthError::InvalidToken,
             })?;
+
+        auth_state.validate_jti(&claims.jti, claims.exp)?;
 
         Ok(AuthenticatedUser {
             subject: claims.sub,
@@ -253,33 +287,88 @@ where
     }
 }
 
+pub struct JtiCache {
+    entries: RwLock<HashMap<String, u64>>,
+    max_entries: usize,
+}
+
+impl JtiCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            max_entries,
+        }
+    }
+
+    pub fn check_and_insert(&self, jti: &str, exp: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut entries = self.entries.write();
+
+        if entries.len() > self.max_entries / 2 {
+            entries.retain(|_, &mut exp_time| exp_time > now);
+        }
+
+        if entries.contains_key(jti) {
+            return false;
+        }
+
+        if entries.len() >= self.max_entries {
+            return false;
+        }
+
+        entries.insert(jti.to_string(), exp);
+        true
+    }
+
+    pub fn contains(&self, jti: &str) -> bool {
+        self.entries.read().contains_key(jti)
+    }
+}
+
+impl Clone for JtiCache {
+    fn clone(&self) -> Self {
+        let entries = self.entries.read().clone();
+        Self {
+            entries: RwLock::new(entries),
+            max_entries: self.max_entries,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthState {
     pub jwt_config: Arc<JwtConfig>,
     pub rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    pub jti_cache: Arc<JtiCache>,
 }
 
 impl AuthState {
     pub fn new(jwt_secret: &[u8], requests_per_second: u32) -> Self {
         let jwt_config = Arc::new(JwtConfig::new(jwt_secret));
-        // Ensure rate limit is at least 1 to prevent panic
         let rps = NonZeroU32::new(requests_per_second.max(1)).expect("max(1) guarantees non-zero");
         let quota = Quota::per_second(rps);
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
+        let jti_cache = Arc::new(JtiCache::new(10000));
         Self {
             jwt_config,
             rate_limiter,
+            jti_cache,
         }
     }
 
     pub fn with_config(jwt_config: Arc<JwtConfig>, requests_per_second: u32) -> Self {
-        // Ensure rate limit is at least 1 to prevent panic
         let rps = NonZeroU32::new(requests_per_second.max(1)).expect("max(1) guarantees non-zero");
         let quota = Quota::per_second(rps);
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
+        let jti_cache = Arc::new(JtiCache::new(10000));
         Self {
             jwt_config,
             rate_limiter,
+            jti_cache,
         }
     }
 
@@ -287,6 +376,13 @@ impl AuthState {
         self.rate_limiter
             .check()
             .map_err(|_| AuthError::RateLimited)
+    }
+
+    pub fn validate_jti(&self, jti: &str, exp: u64) -> Result<(), AuthError> {
+        if !self.jti_cache.check_and_insert(jti, exp) {
+            return Err(AuthError::ReplayedToken);
+        }
+        Ok(())
     }
 
     pub fn generate_token(
@@ -340,11 +436,52 @@ mod tests {
         let decoded = config.decode(&token).unwrap();
         assert_eq!(decoded.sub, "user123");
         assert_eq!(decoded.role, Role::Admin);
+        assert_eq!(decoded.iss, DEFAULT_ISSUER);
+        assert_eq!(decoded.aud, DEFAULT_AUDIENCE);
+        assert!(!decoded.jti.is_empty());
+        assert!(decoded.nbf <= decoded.exp);
+    }
+
+    #[test]
+    fn test_jwt_unique_jti() {
+        let claims1 = Claims::new("user1".to_string(), Role::Admin, Duration::from_secs(3600));
+        let claims2 = Claims::new("user1".to_string(), Role::Admin, Duration::from_secs(3600));
+        assert_ne!(claims1.jti, claims2.jti);
+    }
+
+    #[test]
+    fn test_jti_cache_replay_prevention() {
+        let cache = JtiCache::new(100);
+        let jti = "test-jti-12345";
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        assert!(cache.check_and_insert(jti, exp));
+        assert!(!cache.check_and_insert(jti, exp));
+        assert!(cache.contains(jti));
+    }
+
+    #[test]
+    fn test_auth_state_jti_validation() {
+        let state = AuthState::new(b"test-secret-32-chars-minimum!!!", 10);
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        assert!(state.validate_jti("unique-jti-1", exp).is_ok());
+        assert!(matches!(
+            state.validate_jti("unique-jti-1", exp),
+            Err(AuthError::ReplayedToken)
+        ));
     }
 
     #[test]
     fn test_auth_state_zero_rate_limit_does_not_panic() {
-        // Should not panic with zero rate limit (uses max(1))
         let _state = AuthState::new(b"test-secret-32-chars-minimum!!!", 0);
     }
 }
