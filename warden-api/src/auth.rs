@@ -118,12 +118,48 @@ impl JwtConfig {
     }
 }
 
+#[derive(Default)]
+pub struct TokenBlacklist {
+    entries: RwLock<HashMap<String, u64>>,
+}
+
+impl TokenBlacklist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn revoke(&self, jti: String, exp: u64) {
+        self.entries.write().insert(jti, exp);
+    }
+
+    pub fn is_revoked(&self, jti: &str) -> bool {
+        self.entries.read().contains_key(jti)
+    }
+
+    pub fn cleanup_expired(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.entries.write().retain(|_, exp| *exp > now);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub enum AuthError {
     MissingToken,
     InvalidToken,
     ExpiredToken,
     ReplayedToken,
+    RevokedToken,
     InsufficientPermissions,
     RateLimited,
     InternalError,
@@ -151,6 +187,11 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "REPLAYED_TOKEN",
                 "Token has already been used",
+            ),
+            AuthError::RevokedToken => (
+                StatusCode::UNAUTHORIZED,
+                "REVOKED_TOKEN",
+                "Token has been revoked",
             ),
             AuthError::InsufficientPermissions => (
                 StatusCode::FORBIDDEN,
@@ -216,6 +257,10 @@ where
             })?;
 
         auth_state.validate_jti(&claims.jti, claims.exp)?;
+
+        if auth_state.is_token_revoked(&claims.jti) {
+            return Err(AuthError::RevokedToken);
+        }
 
         Ok(AuthenticatedUser {
             subject: claims.sub,
@@ -344,6 +389,7 @@ pub struct AuthState {
     pub jwt_config: Arc<JwtConfig>,
     pub rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     pub jti_cache: Arc<JtiCache>,
+    pub token_blacklist: Arc<TokenBlacklist>,
 }
 
 impl AuthState {
@@ -357,6 +403,7 @@ impl AuthState {
             jwt_config,
             rate_limiter,
             jti_cache,
+            token_blacklist: Arc::new(TokenBlacklist::new()),
         }
     }
 
@@ -369,6 +416,7 @@ impl AuthState {
             jwt_config,
             rate_limiter,
             jti_cache,
+            token_blacklist: Arc::new(TokenBlacklist::new()),
         }
     }
 
@@ -383,6 +431,18 @@ impl AuthState {
             return Err(AuthError::ReplayedToken);
         }
         Ok(())
+    }
+
+    pub fn revoke_token(&self, jti: String, exp: u64) {
+        self.token_blacklist.revoke(jti, exp);
+    }
+
+    pub fn is_token_revoked(&self, jti: &str) -> bool {
+        self.token_blacklist.is_revoked(jti)
+    }
+
+    pub fn cleanup_blacklist(&self) {
+        self.token_blacklist.cleanup_expired();
     }
 
     pub fn generate_token(
@@ -483,5 +543,58 @@ mod tests {
     #[test]
     fn test_auth_state_zero_rate_limit_does_not_panic() {
         let _state = AuthState::new(b"test-secret-32-chars-minimum!!!", 0);
+    }
+
+    #[test]
+    fn test_token_blacklist_revoke_and_check() {
+        let blacklist = TokenBlacklist::new();
+        let jti = "test-jti-123";
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        assert!(!blacklist.is_revoked(jti));
+        blacklist.revoke(jti.to_string(), exp);
+        assert!(blacklist.is_revoked(jti));
+    }
+
+    #[test]
+    fn test_token_blacklist_cleanup_expired() {
+        let blacklist = TokenBlacklist::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        blacklist.revoke("expired".to_string(), now - 100);
+        blacklist.revoke("valid".to_string(), now + 3600);
+
+        assert_eq!(blacklist.len(), 2);
+        blacklist.cleanup_expired();
+        assert_eq!(blacklist.len(), 1);
+        assert!(!blacklist.is_revoked("expired"));
+        assert!(blacklist.is_revoked("valid"));
+    }
+
+    #[test]
+    fn test_auth_state_revoke_token() {
+        let state = AuthState::new(b"test-secret-32-chars-minimum!!!", 100);
+        let token = state
+            .generate_token("user".to_string(), Role::Admin, Duration::from_secs(3600))
+            .unwrap();
+        let claims = state.jwt_config.decode(&token).unwrap();
+
+        assert!(!state.is_token_revoked(&claims.jti));
+        state.revoke_token(claims.jti.clone(), claims.exp);
+        assert!(state.is_token_revoked(&claims.jti));
+    }
+
+    #[test]
+    fn test_claims_has_unique_jti() {
+        let claims1 = Claims::new("user".to_string(), Role::Admin, Duration::from_secs(3600));
+        let claims2 = Claims::new("user".to_string(), Role::Admin, Duration::from_secs(3600));
+        assert_ne!(claims1.jti, claims2.jti);
     }
 }
