@@ -903,7 +903,7 @@ impl Rfc3161Client {
         signature: &[u8],
     ) -> Result<()> {
         use p256::ecdsa::{Signature, VerifyingKey};
-        use signature::Verifier;
+        use signature::hazmat::PrehashVerifier;
 
         let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse P-256 public key: {}", e)))?;
@@ -911,7 +911,7 @@ impl Rfc3161Client {
             .map_err(|e| Error::Audit(format!("Failed to parse P-256 signature: {}", e)))?;
 
         verifying_key
-            .verify(digest, &sig)
+            .verify_prehash(digest, &sig)
             .map_err(|e| Error::Audit(format!("P-256 signature verification failed: {}", e)))
     }
 
@@ -922,7 +922,7 @@ impl Rfc3161Client {
         signature: &[u8],
     ) -> Result<()> {
         use p384::ecdsa::{Signature, VerifyingKey};
-        use signature::Verifier;
+        use signature::hazmat::PrehashVerifier;
 
         let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse P-384 public key: {}", e)))?;
@@ -930,7 +930,7 @@ impl Rfc3161Client {
             .map_err(|e| Error::Audit(format!("Failed to parse P-384 signature: {}", e)))?;
 
         verifying_key
-            .verify(digest, &sig)
+            .verify_prehash(digest, &sig)
             .map_err(|e| Error::Audit(format!("P-384 signature verification failed: {}", e)))
     }
 
