@@ -85,7 +85,10 @@ impl<S: SlotSupplier> ClosablePermitDealer<S> {
         }
     }
 
-    pub async fn acquire(&self, ctx: &S::Context) -> Result<ClosableOwnedPermit<'_, S>, QuotaError> {
+    pub async fn acquire(
+        &self,
+        ctx: &S::Context,
+    ) -> Result<ClosableOwnedPermit<'_, S>, QuotaError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(QuotaError::Closed);
         }
@@ -135,7 +138,9 @@ impl<S: SlotSupplier> ClosablePermitDealer<S> {
     }
 
     pub async fn drain_with_timeout(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, self.drain_complete()).await.is_ok()
+        tokio::time::timeout(timeout, self.drain_complete())
+            .await
+            .is_ok()
     }
 
     pub fn outstanding_count(&self) -> usize {

@@ -113,14 +113,14 @@ pub use escalation::{
     EscalationPolicyStore, EscalationResults, EscalationStage, FinalAction,
     InMemoryEscalationPolicyStore, PendingWorkflow, WorkflowClient,
 };
-pub use secrets::{
-    AwsSecretsManagerConfig, AwsSecretsManagerProvider, CompositeSecretsProvider,
-    EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
-    VaultSecretsProvider,
-};
 pub use lifecycle::{LifecycleComponent, ServiceLifecycle};
 pub use permit::{
     ClosableOwnedPermit, ClosablePermitDealer, OwnedPermit, PermitDealer, QuotaError,
     SemaphoreSlotSupplier, SlotSupplier,
+};
+pub use secrets::{
+    AwsSecretsManagerConfig, AwsSecretsManagerProvider, CompositeSecretsProvider,
+    EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
+    VaultSecretsProvider,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};

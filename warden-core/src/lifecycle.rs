@@ -156,15 +156,19 @@ mod tests {
         }
 
         async fn start(&self) -> Result<()> {
-            self.start_order
-                .store(self.counter.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            self.start_order.store(
+                self.counter.fetch_add(1, Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             self.started.store(true, Ordering::SeqCst);
             Ok(())
         }
 
         async fn stop(&self) -> Result<()> {
-            self.stop_order
-                .store(self.counter.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            self.stop_order.store(
+                self.counter.fetch_add(1, Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             self.stopped.store(true, Ordering::SeqCst);
             Ok(())
         }
