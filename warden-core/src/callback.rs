@@ -4,12 +4,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use nostr_sdk::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+const JTI_CACHE_TTL_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallbackRequest {
@@ -112,6 +116,8 @@ pub enum CallbackError {
     Timeout,
     #[error("JTI mismatch")]
     JtiMismatch,
+    #[error("JTI replay detected")]
+    JtiReplay,
     #[error("Invalid audience")]
     InvalidAudience,
     #[error("Invalid signature")]
@@ -200,11 +206,51 @@ impl Default for JwsVerifier {
     }
 }
 
+pub struct CallbackJtiCache {
+    entries: RwLock<HashMap<String, i64>>,
+    max_entries: usize,
+}
+
+impl CallbackJtiCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            max_entries,
+        }
+    }
+
+    pub fn check_and_insert(&self, jti: &str, exp: i64) -> bool {
+        let now = Utc::now().timestamp();
+
+        let mut entries = self.entries.write();
+
+        if entries.len() > self.max_entries / 2 {
+            entries.retain(|_, &mut exp_time| exp_time > now);
+        }
+
+        if entries.contains_key(jti) {
+            return false;
+        }
+
+        if entries.len() >= self.max_entries {
+            return false;
+        }
+
+        entries.insert(jti.to_string(), exp);
+        true
+    }
+
+    pub fn contains(&self, jti: &str) -> bool {
+        self.entries.read().contains_key(jti)
+    }
+}
+
 pub struct CallbackGateway {
     http_client: reqwest::Client,
     handlers: HashMap<String, CallbackHandlerConfig>,
     max_retries: u32,
     jws_verifier: JwsVerifier,
+    jti_cache: Arc<CallbackJtiCache>,
 }
 
 impl CallbackGateway {
@@ -214,6 +260,7 @@ impl CallbackGateway {
             handlers: HashMap::new(),
             max_retries: 3,
             jws_verifier: JwsVerifier::new(),
+            jti_cache: Arc::new(CallbackJtiCache::new(10000)),
         }
     }
 
@@ -345,6 +392,11 @@ impl CallbackGateway {
 
         if callback_response.aud != "warden" {
             return Err(CallbackError::InvalidAudience);
+        }
+
+        let cache_expiry = Utc::now().timestamp() + JTI_CACHE_TTL_SECONDS;
+        if !self.jti_cache.check_and_insert(&callback_response.jti, cache_expiry) {
+            return Err(CallbackError::JtiReplay);
         }
 
         Ok(callback_response)
@@ -569,6 +621,7 @@ mod tests {
         assert!(CallbackError::Timeout.is_retryable());
         assert!(CallbackError::HttpError("connection failed".into()).is_retryable());
         assert!(!CallbackError::JtiMismatch.is_retryable());
+        assert!(!CallbackError::JtiReplay.is_retryable());
         assert!(!CallbackError::InvalidAudience.is_retryable());
         assert!(!CallbackError::InvalidSignature.is_retryable());
     }
@@ -579,5 +632,32 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.timeout_seconds, 30);
         assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn test_callback_jti_cache_replay_prevention() {
+        let cache = CallbackJtiCache::new(100);
+        let jti = "callback-jti-12345";
+        let exp = Utc::now().timestamp() + 300;
+
+        assert!(cache.check_and_insert(jti, exp));
+        assert!(!cache.check_and_insert(jti, exp));
+        assert!(cache.contains(jti));
+    }
+
+    #[test]
+    fn test_callback_jti_cache_expiration_cleanup() {
+        let cache = CallbackJtiCache::new(4);
+        let past_exp = Utc::now().timestamp() - 100;
+        let future_exp = Utc::now().timestamp() + 300;
+
+        cache.check_and_insert("expired-1", past_exp);
+        cache.check_and_insert("expired-2", past_exp);
+        cache.check_and_insert("valid-1", future_exp);
+
+        assert!(cache.check_and_insert("new-jti", future_exp));
+        assert!(!cache.contains("expired-1"));
+        assert!(!cache.contains("expired-2"));
+        assert!(cache.contains("valid-1"));
     }
 }

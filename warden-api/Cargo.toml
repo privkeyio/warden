@@ -19,4 +19,5 @@ tower = { workspace = true }
 thiserror = { workspace = true }
 jsonwebtoken = { workspace = true }
 governor = { workspace = true }
+parking_lot = { workspace = true }
 
