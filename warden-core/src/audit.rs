@@ -720,7 +720,7 @@ impl Rfc3161Client {
                     .tbs_certificate
                     .extensions
                     .as_ref()
-                    .map_or(false, |exts| {
+                    .is_some_and(|exts| {
                         exts.iter().any(|ext| {
                             ext.extn_id == oid::SUBJECT_KEY_ID
                                 && ext.extn_value.as_bytes() == skid.0.as_bytes()
