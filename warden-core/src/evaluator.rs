@@ -12,6 +12,33 @@ use crate::policy::{Action, ApprovalConfig, PolicyDecision, Rule};
 use crate::store::{AddressListStore, PolicyStore};
 use crate::{Error, Result};
 
+const MAX_RULES_PER_EVALUATION: usize = 256;
+
+struct EvaluationLimiter {
+    rules_evaluated: usize,
+    max_rules: usize,
+}
+
+impl EvaluationLimiter {
+    fn new(max_rules: usize) -> Self {
+        Self {
+            rules_evaluated: 0,
+            max_rules,
+        }
+    }
+
+    fn check_rule(&mut self) -> Result<()> {
+        self.rules_evaluated += 1;
+        if self.rules_evaluated > self.max_rules {
+            return Err(Error::Evaluation(format!(
+                "evaluation limit exceeded: evaluated {} rules (max {})",
+                self.rules_evaluated, self.max_rules
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionRequest {
     pub id: Uuid,
@@ -123,6 +150,7 @@ pub struct PolicyEvaluator {
     policy_store: Arc<dyn PolicyStore>,
     whitelist_store: Arc<dyn AddressListStore>,
     blacklist_store: Arc<dyn AddressListStore>,
+    max_rules: usize,
 }
 
 impl PolicyEvaluator {
@@ -135,12 +163,19 @@ impl PolicyEvaluator {
             policy_store,
             whitelist_store,
             blacklist_store,
+            max_rules: MAX_RULES_PER_EVALUATION,
         }
+    }
+
+    pub fn with_max_rules(mut self, max_rules: usize) -> Self {
+        self.max_rules = max_rules;
+        self
     }
 
     pub async fn evaluate(&self, request: &TransactionRequest) -> Result<EvaluationResult> {
         let start = Instant::now();
         let mut trace = Vec::new();
+        let mut limiter = EvaluationLimiter::new(self.max_rules);
 
         let policy = self
             .policy_store
@@ -155,6 +190,7 @@ impl PolicyEvaluator {
         );
 
         for rule in &policy.rules {
+            limiter.check_rule()?;
             let match_result = self.evaluate_rule(rule, &context).await?;
 
             trace.push(RuleTraceEntry {
@@ -359,5 +395,24 @@ mod tests {
         let tx = TransactionRequest::new("treasury-hot-1".into(), "bc1qtest".into(), 1_000_000);
         assert_eq!(tx.source_wallet, "treasury-hot-1");
         assert_eq!(tx.amount_sats, 1_000_000);
+    }
+
+    #[test]
+    fn test_evaluation_limiter_allows_within_limit() {
+        let mut limiter = EvaluationLimiter::new(3);
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+    }
+
+    #[test]
+    fn test_evaluation_limiter_blocks_over_limit() {
+        let mut limiter = EvaluationLimiter::new(2);
+        assert!(limiter.check_rule().is_ok());
+        assert!(limiter.check_rule().is_ok());
+        let err = limiter.check_rule().unwrap_err();
+        assert!(err.to_string().contains("evaluation limit exceeded"));
+        assert!(err.to_string().contains("3 rules"));
+        assert!(err.to_string().contains("max 2"));
     }
 }

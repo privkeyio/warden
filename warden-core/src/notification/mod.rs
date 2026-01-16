@@ -33,7 +33,7 @@ mod tests {
     }
 
     impl MockSender {
-        fn new(_should_fail: bool) -> Self {
+        fn new() -> Self {
             Self {
                 fail_count: std::sync::atomic::AtomicU32::new(0),
             }
@@ -70,8 +70,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_service_success() {
-        let mut service = NotificationService::new();
-        service.register_sender(Arc::new(MockSender::new(false)));
+        let service = NotificationService::new();
+        service.register_sender(Arc::new(MockSender::new())).await;
 
         let notification = Notification::ApprovalRequest(ApprovalRequestNotification {
             workflow_id: Uuid::new_v4(),
@@ -95,13 +95,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_service_retry() {
-        let mut service = NotificationService::new().with_retry_policy(RetryPolicy {
+        let service = NotificationService::new().with_retry_policy(RetryPolicy {
             max_attempts: 3,
             initial_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(10),
             backoff_multiplier: 2.0,
         });
-        service.register_sender(Arc::new(MockSender::failing_n_times(2)));
+        service
+            .register_sender(Arc::new(MockSender::failing_n_times(2)))
+            .await;
 
         let notification = Notification::ApprovalRequest(ApprovalRequestNotification {
             workflow_id: Uuid::new_v4(),
