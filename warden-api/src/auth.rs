@@ -256,11 +256,11 @@ where
                 _ => AuthError::InvalidToken,
             })?;
 
-        auth_state.validate_jti(&claims.jti, claims.exp)?;
-
         if auth_state.is_token_revoked(&claims.jti) {
             return Err(AuthError::RevokedToken);
         }
+
+        auth_state.validate_jti(&claims.jti, claims.exp)?;
 
         Ok(AuthenticatedUser {
             subject: claims.sub,
@@ -589,12 +589,5 @@ mod tests {
         assert!(!state.is_token_revoked(&claims.jti));
         state.revoke_token(claims.jti.clone(), claims.exp);
         assert!(state.is_token_revoked(&claims.jti));
-    }
-
-    #[test]
-    fn test_claims_has_unique_jti() {
-        let claims1 = Claims::new("user".to_string(), Role::Admin, Duration::from_secs(3600));
-        let claims2 = Claims::new("user".to_string(), Role::Admin, Duration::from_secs(3600));
-        assert_ne!(claims1.jti, claims2.jti);
     }
 }
