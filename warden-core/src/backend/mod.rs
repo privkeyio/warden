@@ -305,9 +305,10 @@ impl<B: SigningBackend + 'static> SigningBackend for RetryingSigningBackend<B> {
     }
 
     async fn initiate_signing(&self, request: SigningRequest) -> Result<SigningSession> {
-        self.retry_policy
-            .execute(|| self.inner.initiate_signing(request.clone()))
-            .await
+        // Do not retry initiate_signing: session creation is not idempotent since each
+        // call generates a new session_id, and backends don't track by transaction_id.
+        // Retrying would create duplicate sessions for the same transaction.
+        self.inner.initiate_signing(request).await
     }
 
     async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
