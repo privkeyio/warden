@@ -4,38 +4,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::types::{notification_type_name, Notification, NotificationRecord, NotificationStatus};
-
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
-impl RetryPolicy {
-    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_secs =
-            self.initial_delay.as_secs_f64() * self.backoff_multiplier.powi(attempt as i32 - 1);
-        Duration::from_secs_f64(delay_secs.min(self.max_delay.as_secs_f64()))
-    }
-}
+pub use crate::retry::RetryPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationError {
@@ -145,14 +118,14 @@ impl NotificationService {
         recipient: &str,
         record: &mut NotificationRecord,
     ) -> std::result::Result<(), NotificationError> {
-        if self.retry_policy.max_attempts == 0 {
-            let err = NotificationError::SendFailed("max_attempts is 0".into());
+        if self.retry_policy.maximum_attempts == 0 {
+            let err = NotificationError::SendFailed("maximum_attempts is 0".into());
             record.status = NotificationStatus::Failed;
             record.error_message = Some(err.to_string());
             return Err(err);
         }
 
-        for attempt in 1..=self.retry_policy.max_attempts {
+        for attempt in 1..=self.retry_policy.maximum_attempts {
             record.retry_count = attempt - 1;
 
             match sender.send(notification, recipient).await {
@@ -161,7 +134,7 @@ impl NotificationService {
                     record.sent_at = Some(Utc::now());
                     return Ok(());
                 }
-                Err(e) if e.is_retryable() && attempt < self.retry_policy.max_attempts => {
+                Err(e) if e.is_retryable() && attempt < self.retry_policy.maximum_attempts => {
                     let delay = self.retry_policy.delay_for_attempt(attempt);
                     tokio::time::sleep(delay).await;
                 }

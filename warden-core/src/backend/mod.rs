@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::retry::{ClassifyError, ErrorKind, TieredRetryPolicy};
 use crate::{Error, Result};
 
 #[cfg(feature = "keep")]
@@ -248,6 +249,87 @@ impl SigningBackend for MockSigningBackend {
             }
             None => Err(Error::SessionNotFound(session_id.to_string())),
         }
+    }
+}
+
+impl ClassifyError for Error {
+    fn error_kind(&self) -> ErrorKind {
+        match self {
+            Self::SessionNotFound(_) => ErrorKind::NotFound,
+            Self::SignatureNotReady(_) => ErrorKind::Transient,
+            Self::Backend(msg) if msg.contains("timeout") => ErrorKind::Timeout,
+            Self::Backend(msg) if msg.contains("rate") => ErrorKind::RateLimited,
+            Self::Backend(_) => ErrorKind::Transient,
+            Self::SigningFailed(_) => ErrorKind::Permanent,
+            Self::ApproverNotAuthorized(_) => ErrorKind::Unauthorized,
+            Self::InvalidInput(_) => ErrorKind::InvalidArgument,
+            Self::NotFound(_) => ErrorKind::NotFound,
+            _ => ErrorKind::Permanent,
+        }
+    }
+}
+
+pub struct RetryingSigningBackend<B: SigningBackend> {
+    inner: Arc<B>,
+    retry_policy: TieredRetryPolicy,
+}
+
+impl<B: SigningBackend> RetryingSigningBackend<B> {
+    pub fn new(backend: Arc<B>) -> Self {
+        Self {
+            inner: backend,
+            retry_policy: TieredRetryPolicy::default(),
+        }
+    }
+
+    pub fn with_retry_policy(mut self, policy: TieredRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+}
+
+#[async_trait]
+impl<B: SigningBackend + 'static> SigningBackend for RetryingSigningBackend<B> {
+    fn backend_id(&self) -> &str {
+        self.inner.backend_id()
+    }
+
+    async fn health_check(&self) -> Result<HealthStatus> {
+        self.inner.health_check().await
+    }
+
+    async fn get_public_key(&self, wallet_id: &WalletId) -> Result<PublicKey> {
+        self.retry_policy
+            .execute(|| self.inner.get_public_key(wallet_id))
+            .await
+    }
+
+    async fn initiate_signing(&self, request: SigningRequest) -> Result<SigningSession> {
+        self.retry_policy
+            .execute(|| self.inner.initiate_signing(request.clone()))
+            .await
+    }
+
+    async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
+        self.retry_policy
+            .execute(|| self.inner.get_session(session_id))
+            .await
+    }
+
+    async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus> {
+        self.retry_policy
+            .execute(|| self.inner.get_session_status(session_id))
+            .await
+    }
+
+    async fn get_signature(&self, session_id: &SessionId) -> Result<Signature> {
+        self.retry_policy
+            .execute(|| self.inner.get_signature(session_id))
+            .await
+    }
+
+    async fn cancel_session(&self, session_id: &SessionId) -> Result<()> {
+        self.inner.cancel_session(session_id).await
     }
 }
 

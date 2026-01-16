@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crate::callback::{CallbackDecision, CallbackRequest, CallbackResponse};
+use crate::retry::{ClassifyError, ErrorKind, TieredRetryPolicy};
 use crate::secrets::SecretValue;
 use crate::ssrf::{validate_url, SsrfError, SsrfPolicy};
 use chrono::{DateTime, Utc};
@@ -70,6 +71,20 @@ pub enum ComplianceError {
 impl From<SsrfError> for ComplianceError {
     fn from(err: SsrfError) -> Self {
         ComplianceError::SsrfBlocked(err.to_string())
+    }
+}
+
+impl ClassifyError for ComplianceError {
+    fn error_kind(&self) -> ErrorKind {
+        match self {
+            Self::Timeout => ErrorKind::Timeout,
+            Self::RateLimited => ErrorKind::RateLimited,
+            Self::AuthenticationFailed => ErrorKind::Unauthorized,
+            Self::AddressNotFound(_) => ErrorKind::NotFound,
+            Self::ConfigurationError(_) => ErrorKind::InvalidArgument,
+            Self::SsrfBlocked(_) => ErrorKind::Permanent,
+            Self::ApiError(_) => ErrorKind::Transient,
+        }
     }
 }
 
@@ -650,6 +665,56 @@ impl ComplianceProvider for MockComplianceProvider {
 
     async fn health_check(&self) -> std::result::Result<(), ComplianceError> {
         Ok(())
+    }
+}
+
+pub struct RetryingComplianceProvider<P: ComplianceProvider> {
+    inner: P,
+    retry_policy: TieredRetryPolicy,
+}
+
+impl<P: ComplianceProvider> RetryingComplianceProvider<P> {
+    pub fn new(provider: P) -> Self {
+        Self {
+            inner: provider,
+            retry_policy: TieredRetryPolicy::default(),
+        }
+    }
+
+    pub fn with_retry_policy(mut self, policy: TieredRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: ComplianceProvider> ComplianceProvider for RetryingComplianceProvider<P> {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    async fn screen_address(
+        &self,
+        address: &str,
+    ) -> std::result::Result<ScreeningResult, ComplianceError> {
+        self.retry_policy
+            .execute(|| self.inner.screen_address(address))
+            .await
+    }
+
+    async fn register_transfer(
+        &self,
+        tx_hash: &str,
+        output_address: &str,
+        amount_btc: f64,
+    ) -> std::result::Result<(), ComplianceError> {
+        self.retry_policy
+            .execute(|| self.inner.register_transfer(tx_hash, output_address, amount_btc))
+            .await
+    }
+
+    async fn health_check(&self) -> std::result::Result<(), ComplianceError> {
+        self.inner.health_check().await
     }
 }
 

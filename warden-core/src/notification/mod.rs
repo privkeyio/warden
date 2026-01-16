@@ -96,10 +96,11 @@ mod tests {
     #[tokio::test]
     async fn test_notification_service_retry() {
         let service = NotificationService::new().with_retry_policy(RetryPolicy {
-            max_attempts: 3,
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_multiplier: 2.0,
+            maximum_attempts: 3,
+            initial_interval: Duration::from_millis(1),
+            maximum_interval: Duration::from_millis(10),
+            backoff_coefficient: 2.0,
+            jitter_percent: 0.0,
         });
         service
             .register_sender(Arc::new(MockSender::failing_n_times(2)))
@@ -127,10 +128,11 @@ mod tests {
     #[test]
     fn test_retry_policy_delay() {
         let policy = RetryPolicy {
-            max_attempts: 5,
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-            backoff_multiplier: 2.0,
+            maximum_attempts: 5,
+            initial_interval: Duration::from_secs(1),
+            maximum_interval: Duration::from_secs(60),
+            backoff_coefficient: 2.0,
+            jitter_percent: 0.0,
         };
 
         assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(1));
