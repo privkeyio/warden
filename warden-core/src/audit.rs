@@ -963,7 +963,17 @@ impl<S: AuditStore, T: AuditSigner> AuditLog<S, T> {
         event.signature = self.signer.sign(&event.hash)?;
 
         if let Some(ref tsa) = self.tsa_client {
-            event.rfc3161_token = tsa.timestamp(&event.hash).await.ok();
+            match tsa.timestamp(&event.hash).await {
+                Ok(token) => event.rfc3161_token = Some(token),
+                Err(e) => {
+                    tracing::error!(
+                        event_id = %event.id.0,
+                        sequence = event.sequence,
+                        error = %e,
+                        "RFC3161 timestamp request failed"
+                    );
+                }
+            }
         }
 
         self.store.verify_append_only(&event).await?;
