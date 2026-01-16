@@ -137,6 +137,7 @@ impl ClassifyError for CallbackError {
             Self::HandlerNotFound(_) => ErrorKind::NotFound,
             Self::HandlerDisabled(_) => ErrorKind::Permanent,
             Self::JtiMismatch => ErrorKind::InvalidArgument,
+            Self::JtiReplay => ErrorKind::Permanent,
             Self::InvalidAudience => ErrorKind::InvalidArgument,
             Self::InvalidSignature => ErrorKind::Unauthorized,
             Self::MaxRetriesExceeded => ErrorKind::Permanent,
