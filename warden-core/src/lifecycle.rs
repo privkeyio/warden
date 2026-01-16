@@ -37,7 +37,10 @@ impl ServiceLifecycle {
     pub async fn start(&mut self) -> Result<()> {
         for (idx, component) in self.components.iter().enumerate() {
             if self.startup_order.contains(&idx) {
-                info!(component = component.name(), "Skipping already started component");
+                info!(
+                    component = component.name(),
+                    "Skipping already started component"
+                );
                 continue;
             }
             info!(component = component.name(), "Starting component");
@@ -57,7 +60,10 @@ impl ServiceLifecycle {
         }
         if self.startup_order.contains(&idx) {
             let component = &self.components[idx];
-            info!(component = component.name(), "Component already started, skipping");
+            info!(
+                component = component.name(),
+                "Component already started, skipping"
+            );
             return Ok(());
         }
         let component = &self.components[idx];
