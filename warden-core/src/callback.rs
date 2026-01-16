@@ -395,7 +395,10 @@ impl CallbackGateway {
         }
 
         let cache_expiry = Utc::now().timestamp() + JTI_CACHE_TTL_SECONDS;
-        if !self.jti_cache.check_and_insert(&callback_response.jti, cache_expiry) {
+        if !self
+            .jti_cache
+            .check_and_insert(&callback_response.jti, cache_expiry)
+        {
             return Err(CallbackError::JtiReplay);
         }
 
