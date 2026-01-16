@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::quorum::GroupId;
@@ -197,40 +197,40 @@ impl Default for InMemoryGroupStore {
 #[async_trait]
 impl GroupStore for InMemoryGroupStore {
     async fn create(&self, group: ApproverGroup) -> Result<ApproverGroup> {
-        let mut groups = self.groups.write().expect("lock poisoned");
+        let mut groups = self.groups.write();
         groups.insert(group.id, group.clone());
         Ok(group)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<ApproverGroup>> {
-        let groups = self.groups.read().expect("lock poisoned");
+        let groups = self.groups.read();
         Ok(groups.get(id).cloned())
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<ApproverGroup>> {
-        let groups = self.groups.read().expect("lock poisoned");
+        let groups = self.groups.read();
         Ok(groups.values().find(|g| g.name == name).cloned())
     }
 
     async fn list(&self) -> Result<Vec<ApproverGroup>> {
-        let groups = self.groups.read().expect("lock poisoned");
+        let groups = self.groups.read();
         Ok(groups.values().cloned().collect())
     }
 
     async fn update(&self, group: ApproverGroup) -> Result<ApproverGroup> {
-        let mut groups = self.groups.write().expect("lock poisoned");
+        let mut groups = self.groups.write();
         groups.insert(group.id, group.clone());
         Ok(group)
     }
 
     async fn delete(&self, id: &Uuid) -> Result<()> {
-        let mut groups = self.groups.write().expect("lock poisoned");
+        let mut groups = self.groups.write();
         groups.remove(id);
         Ok(())
     }
 
     async fn add_member(&self, group_id: &Uuid, member: GroupMember) -> Result<ApproverGroup> {
-        let mut groups = self.groups.write().expect("lock poisoned");
+        let mut groups = self.groups.write();
         if let Some(group) = groups.get_mut(group_id) {
             group.add_member(member);
             Ok(group.clone())
@@ -243,7 +243,7 @@ impl GroupStore for InMemoryGroupStore {
     }
 
     async fn remove_member(&self, group_id: &Uuid, approver_id: &str) -> Result<ApproverGroup> {
-        let mut groups = self.groups.write().expect("lock poisoned");
+        let mut groups = self.groups.write();
         if let Some(group) = groups.get_mut(group_id) {
             group.remove_member(approver_id);
             Ok(group.clone())
@@ -256,7 +256,7 @@ impl GroupStore for InMemoryGroupStore {
     }
 
     async fn get_groups_for_approver(&self, approver_id: &str) -> Result<Vec<ApproverGroup>> {
-        let groups = self.groups.read().expect("lock poisoned");
+        let groups = self.groups.read();
         Ok(groups
             .values()
             .filter(|g| g.has_member(approver_id))

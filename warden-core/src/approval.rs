@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::policy::ApprovalConfig;
@@ -551,18 +551,18 @@ impl Default for InMemoryApprovalStore {
 #[async_trait]
 impl ApprovalStore for InMemoryApprovalStore {
     async fn create(&self, request: ApprovalRequest) -> Result<ApprovalRequest> {
-        let mut requests = self.requests.write().expect("lock poisoned");
+        let mut requests = self.requests.write();
         requests.insert(request.id, request.clone());
         Ok(request)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<ApprovalRequest>> {
-        let requests = self.requests.read().expect("lock poisoned");
+        let requests = self.requests.read();
         Ok(requests.get(id).cloned())
     }
 
     async fn get_by_transaction(&self, transaction_id: &Uuid) -> Result<Option<ApprovalRequest>> {
-        let requests = self.requests.read().expect("lock poisoned");
+        let requests = self.requests.read();
         Ok(requests
             .values()
             .find(|r| &r.transaction_id == transaction_id)
@@ -570,13 +570,13 @@ impl ApprovalStore for InMemoryApprovalStore {
     }
 
     async fn update(&self, request: ApprovalRequest) -> Result<ApprovalRequest> {
-        let mut requests = self.requests.write().expect("lock poisoned");
+        let mut requests = self.requests.write();
         requests.insert(request.id, request.clone());
         Ok(request)
     }
 
     async fn list_pending(&self) -> Result<Vec<ApprovalRequest>> {
-        let requests = self.requests.read().expect("lock poisoned");
+        let requests = self.requests.read();
         Ok(requests
             .values()
             .filter(|r| r.status == ApprovalStatus::Pending)
@@ -606,13 +606,13 @@ impl Default for InMemoryWorkflowStore {
 #[async_trait]
 impl WorkflowStore for InMemoryWorkflowStore {
     async fn create_workflow(&self, workflow: ApprovalWorkflow) -> Result<ApprovalWorkflow> {
-        let mut workflows = self.workflows.write().expect("lock poisoned");
+        let mut workflows = self.workflows.write();
         workflows.insert(workflow.id, workflow.clone());
         Ok(workflow)
     }
 
     async fn get_workflow(&self, id: &Uuid) -> Result<Option<ApprovalWorkflow>> {
-        let workflows = self.workflows.read().expect("lock poisoned");
+        let workflows = self.workflows.read();
         Ok(workflows.get(id).cloned())
     }
 
@@ -620,7 +620,7 @@ impl WorkflowStore for InMemoryWorkflowStore {
         &self,
         transaction_id: &Uuid,
     ) -> Result<Option<ApprovalWorkflow>> {
-        let workflows = self.workflows.read().expect("lock poisoned");
+        let workflows = self.workflows.read();
         Ok(workflows
             .values()
             .find(|w| &w.transaction_id == transaction_id)
@@ -628,13 +628,13 @@ impl WorkflowStore for InMemoryWorkflowStore {
     }
 
     async fn update_workflow(&self, workflow: ApprovalWorkflow) -> Result<ApprovalWorkflow> {
-        let mut workflows = self.workflows.write().expect("lock poisoned");
+        let mut workflows = self.workflows.write();
         workflows.insert(workflow.id, workflow.clone());
         Ok(workflow)
     }
 
     async fn list_pending_workflows(&self) -> Result<Vec<ApprovalWorkflow>> {
-        let workflows = self.workflows.read().expect("lock poisoned");
+        let workflows = self.workflows.read();
         Ok(workflows
             .values()
             .filter(|w| w.status == WorkflowStatus::Pending)
@@ -647,7 +647,7 @@ impl WorkflowStore for InMemoryWorkflowStore {
         approver_id: &str,
         groups: &[GroupId],
     ) -> Result<Vec<ApprovalWorkflow>> {
-        let workflows = self.workflows.read().expect("lock poisoned");
+        let workflows = self.workflows.read();
         Ok(workflows
             .values()
             .filter(|w| w.can_approve(approver_id, groups))
@@ -660,7 +660,7 @@ impl WorkflowStore for InMemoryWorkflowStore {
         workflow_id: &Uuid,
         approval: Approval,
     ) -> Result<ApprovalWorkflow> {
-        let mut workflows = self.workflows.write().expect("lock poisoned");
+        let mut workflows = self.workflows.write();
         if let Some(workflow) = workflows.get_mut(workflow_id) {
             workflow.add_approval(approval);
             Ok(workflow.clone())

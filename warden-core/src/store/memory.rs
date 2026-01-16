@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use uuid::Uuid;
 
 use super::{AddressEntry, AddressListStore, PolicyStore};
@@ -32,24 +32,24 @@ impl Default for InMemoryAddressListStore {
 #[async_trait]
 impl AddressListStore for InMemoryAddressListStore {
     async fn create_list(&self, name: &str) -> Result<()> {
-        let mut lists = self.lists.write().expect("lock poisoned");
+        let mut lists = self.lists.write();
         lists.entry(name.to_string()).or_default();
         Ok(())
     }
 
     async fn delete_list(&self, name: &str) -> Result<()> {
-        let mut lists = self.lists.write().expect("lock poisoned");
+        let mut lists = self.lists.write();
         lists.remove(name);
         Ok(())
     }
 
     async fn list_names(&self) -> Result<Vec<String>> {
-        let lists = self.lists.read().expect("lock poisoned");
+        let lists = self.lists.read();
         Ok(lists.keys().cloned().collect())
     }
 
     async fn add_address(&self, list_name: &str, address: &str, label: Option<&str>) -> Result<()> {
-        let mut lists = self.lists.write().expect("lock poisoned");
+        let mut lists = self.lists.write();
         let list = lists
             .get_mut(list_name)
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
@@ -58,7 +58,7 @@ impl AddressListStore for InMemoryAddressListStore {
     }
 
     async fn remove_address(&self, list_name: &str, address: &str) -> Result<()> {
-        let mut lists = self.lists.write().expect("lock poisoned");
+        let mut lists = self.lists.write();
         let list = lists
             .get_mut(list_name)
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
@@ -67,7 +67,7 @@ impl AddressListStore for InMemoryAddressListStore {
     }
 
     async fn contains(&self, list_name: &str, address: &str) -> Result<bool> {
-        let lists = self.lists.read().expect("lock poisoned");
+        let lists = self.lists.read();
         let list = lists
             .get(list_name)
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
@@ -75,7 +75,7 @@ impl AddressListStore for InMemoryAddressListStore {
     }
 
     async fn list_addresses(&self, list_name: &str) -> Result<Vec<AddressEntry>> {
-        let lists = self.lists.read().expect("lock poisoned");
+        let lists = self.lists.read();
         let list = lists
             .get(list_name)
             .ok_or_else(|| Error::AddressListNotFound(list_name.to_string()))?;
@@ -125,48 +125,48 @@ impl Default for InMemoryPolicyStore {
 #[async_trait]
 impl PolicyStore for InMemoryPolicyStore {
     async fn create(&self, policy: Policy) -> Result<Policy> {
-        let mut policies = self.policies.write().expect("lock poisoned");
+        let mut policies = self.policies.write();
         policies.insert(policy.id, policy.clone());
         Ok(policy)
     }
 
     async fn get(&self, id: &Uuid) -> Result<Option<Policy>> {
-        let policies = self.policies.read().expect("lock poisoned");
+        let policies = self.policies.read();
         Ok(policies.get(id).cloned())
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Policy>> {
-        let policies = self.policies.read().expect("lock poisoned");
+        let policies = self.policies.read();
         Ok(policies.values().find(|p| p.name == name).cloned())
     }
 
     async fn list(&self) -> Result<Vec<Policy>> {
-        let policies = self.policies.read().expect("lock poisoned");
+        let policies = self.policies.read();
         Ok(policies.values().cloned().collect())
     }
 
     async fn update(&self, policy: Policy) -> Result<Policy> {
-        let mut policies = self.policies.write().expect("lock poisoned");
+        let mut policies = self.policies.write();
         policies.insert(policy.id, policy.clone());
         Ok(policy)
     }
 
     async fn delete(&self, id: &Uuid) -> Result<()> {
-        let mut policies = self.policies.write().expect("lock poisoned");
+        let mut policies = self.policies.write();
         policies.remove(id);
-        let mut bindings = self.wallet_bindings.write().expect("lock poisoned");
+        let mut bindings = self.wallet_bindings.write();
         bindings.retain(|_, v| v != id);
         Ok(())
     }
 
     async fn activate(&self, id: &Uuid) -> Result<()> {
-        let mut policies = self.policies.write().expect("lock poisoned");
+        let mut policies = self.policies.write();
         let policy = policies
             .get_mut(id)
             .ok_or_else(|| Error::NoPolicyFound(id.to_string()))?;
         policy.is_active = true;
 
-        let mut bindings = self.wallet_bindings.write().expect("lock poisoned");
+        let mut bindings = self.wallet_bindings.write();
         let mut found_wallets = false;
         for rule in &policy.rules {
             if let Some(ref wallets) = rule.conditions.source_wallets {
@@ -183,20 +183,26 @@ impl PolicyStore for InMemoryPolicyStore {
     }
 
     async fn deactivate(&self, id: &Uuid) -> Result<()> {
-        let mut policies = self.policies.write().expect("lock poisoned");
+        let mut policies = self.policies.write();
         if let Some(policy) = policies.get_mut(id) {
             policy.is_active = false;
         }
-        let mut bindings = self.wallet_bindings.write().expect("lock poisoned");
+        let mut bindings = self.wallet_bindings.write();
         bindings.retain(|_, v| v != id);
         Ok(())
     }
 
     async fn get_active_policy(&self, wallet_id: &str) -> Result<Option<Policy>> {
-        let bindings = self.wallet_bindings.read().expect("lock poisoned");
-        let policies = self.policies.read().expect("lock poisoned");
+        // Read bindings first and release lock before acquiring policies lock.
+        // This matches the lock order used by activate/deactivate (policies -> bindings)
+        // by not holding both locks simultaneously.
+        let maybe_policy_id = {
+            let bindings = self.wallet_bindings.read();
+            self.find_matching_binding(wallet_id, &bindings)
+        };
 
-        if let Some(policy_id) = self.find_matching_binding(wallet_id, &bindings) {
+        let policies = self.policies.read();
+        if let Some(policy_id) = maybe_policy_id {
             return Ok(policies.get(&policy_id).cloned());
         }
 

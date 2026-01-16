@@ -6,9 +6,10 @@ use async_trait::async_trait;
 #[cfg(any(test, feature = "mock"))]
 use chrono::Duration;
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{Error, Result};
@@ -117,33 +118,29 @@ impl BackendRegistry {
 
     pub fn register(&self, backend: Arc<dyn SigningBackend>) {
         let id = backend.backend_id().to_string();
-        let mut backends = self.backends.write().expect("lock poisoned");
+        let mut backends = self.backends.write();
         let is_first = backends.is_empty();
         backends.insert(id.clone(), backend);
         if is_first {
-            *self.default_backend.write().expect("lock poisoned") = id;
+            *self.default_backend.write() = id;
         }
     }
 
     pub fn set_default(&self, id: &str) -> Result<()> {
-        let backends = self.backends.read().expect("lock poisoned");
+        let backends = self.backends.read();
         if !backends.contains_key(id) {
             return Err(Error::Backend(format!("backend '{}' not found", id)));
         }
-        *self.default_backend.write().expect("lock poisoned") = id.to_string();
+        *self.default_backend.write() = id.to_string();
         Ok(())
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn SigningBackend>> {
-        self.backends
-            .read()
-            .expect("lock poisoned")
-            .get(id)
-            .cloned()
+        self.backends.read().get(id).cloned()
     }
 
     pub fn get_default(&self) -> Result<Arc<dyn SigningBackend>> {
-        let default_id = self.default_backend.read().expect("lock poisoned").clone();
+        let default_id = self.default_backend.read().clone();
         if default_id.is_empty() {
             return Err(Error::Backend("no backends registered".into()));
         }
@@ -152,12 +149,7 @@ impl BackendRegistry {
     }
 
     pub fn list(&self) -> Vec<String> {
-        self.backends
-            .read()
-            .expect("lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.backends.read().keys().cloned().collect()
     }
 }
 
@@ -216,7 +208,6 @@ impl SigningBackend for MockSigningBackend {
         };
         self.sessions
             .write()
-            .expect("lock poisoned")
             .insert(session.session_id, session.clone());
         Ok(session)
     }
@@ -224,7 +215,6 @@ impl SigningBackend for MockSigningBackend {
     async fn get_session(&self, session_id: &SessionId) -> Result<SigningSession> {
         self.sessions
             .read()
-            .expect("lock poisoned")
             .get(session_id)
             .cloned()
             .ok_or_else(|| Error::SessionNotFound(session_id.to_string()))
@@ -233,14 +223,13 @@ impl SigningBackend for MockSigningBackend {
     async fn get_session_status(&self, session_id: &SessionId) -> Result<SessionStatus> {
         self.sessions
             .read()
-            .expect("lock poisoned")
             .get(session_id)
             .map(|s| s.status.clone())
             .ok_or_else(|| Error::SessionNotFound(session_id.to_string()))
     }
 
     async fn get_signature(&self, session_id: &SessionId) -> Result<Signature> {
-        let sessions = self.sessions.read().expect("lock poisoned");
+        let sessions = self.sessions.read();
         match sessions.get(session_id) {
             Some(s) => s
                 .signature
@@ -251,7 +240,7 @@ impl SigningBackend for MockSigningBackend {
     }
 
     async fn cancel_session(&self, session_id: &SessionId) -> Result<()> {
-        let mut sessions = self.sessions.write().expect("lock poisoned");
+        let mut sessions = self.sessions.write();
         match sessions.get_mut(session_id) {
             Some(session) => {
                 session.status = SessionStatus::Cancelled;
