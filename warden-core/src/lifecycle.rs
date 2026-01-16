@@ -36,6 +36,10 @@ impl ServiceLifecycle {
 
     pub async fn start(&mut self) -> Result<()> {
         for (idx, component) in self.components.iter().enumerate() {
+            if self.startup_order.contains(&idx) {
+                info!(component = component.name(), "Skipping already started component");
+                continue;
+            }
             info!(component = component.name(), "Starting component");
             component.start().await?;
             self.startup_order.push(idx);
@@ -51,12 +55,15 @@ impl ServiceLifecycle {
                 idx
             )));
         }
+        if self.startup_order.contains(&idx) {
+            let component = &self.components[idx];
+            info!(component = component.name(), "Component already started, skipping");
+            return Ok(());
+        }
         let component = &self.components[idx];
         info!(component = component.name(), "Starting component");
         component.start().await?;
-        if !self.startup_order.contains(&idx) {
-            self.startup_order.push(idx);
-        }
+        self.startup_order.push(idx);
         info!(component = component.name(), "Component started");
         Ok(())
     }
@@ -68,6 +75,11 @@ impl ServiceLifecycle {
         }
 
         let per_component_timeout = timeout / (component_count as u32 * 2);
+        let per_component_timeout = if per_component_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            per_component_timeout
+        };
 
         for idx in self.startup_order.iter().rev() {
             let component = &self.components[*idx];
@@ -95,13 +107,23 @@ impl ServiceLifecycle {
     }
 
     pub async fn shutdown_with_force(&self, timeout: Duration) {
-        if tokio::time::timeout(timeout, self.shutdown(timeout))
+        // Use 90% of the timeout for inner shutdown so outer timeout can pre-empt
+        let inner_timeout = timeout.mul_f64(0.9);
+        info!(
+            total_timeout_ms = timeout.as_millis(),
+            inner_timeout_ms = inner_timeout.as_millis(),
+            "Starting graceful shutdown with force"
+        );
+        if tokio::time::timeout(timeout, self.shutdown(inner_timeout))
             .await
             .is_ok()
         {
             info!("Graceful shutdown completed");
         } else {
-            warn!("Shutdown timeout exceeded, force stopping");
+            warn!(
+                timeout_ms = timeout.as_millis(),
+                "Shutdown timeout exceeded, force stopping"
+            );
         }
     }
 
