@@ -23,6 +23,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+sha3 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 cms = { workspace = true }
@@ -30,6 +31,11 @@ x509-cert = { workspace = true }
 der = { workspace = true }
 const-oid = { workspace = true }
 spki = { workspace = true }
+rsa = { workspace = true }
+ecdsa = { workspace = true }
+p256 = { workspace = true }
+p384 = { workspace = true }
+signature = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
