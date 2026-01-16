@@ -110,6 +110,45 @@ mod base64_serde {
     }
 }
 
+mod oid {
+    use der::oid::ObjectIdentifier;
+
+    // Hash algorithm OIDs
+    pub const SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    pub const SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+    pub const SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
+
+    // RSA signature algorithm OIDs
+    pub const RSA_ENCRYPTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    pub const RSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+    pub const RSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+    pub const RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+
+    // ECDSA signature algorithm OIDs
+    pub const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    pub const ECDSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+
+    // Key type OIDs
+    pub const EC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+    // EC curve OIDs
+    pub const SECP256R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+    pub const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+
+    // CMS/PKCS#7 OIDs
+    pub const SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+    pub const MESSAGE_DIGEST: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
+    // X.509 extension OIDs
+    pub const SUBJECT_KEY_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
+    pub const KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+    pub const BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+    pub const EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
+    pub const TSA_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+}
+
 mod rfc3161 {
     use der::asn1::{GeneralizedTime, OctetString};
     use der::Sequence;
@@ -551,17 +590,10 @@ impl Rfc3161Client {
     fn compute_digest(&self, alg_oid: &der::oid::ObjectIdentifier, data: &[u8]) -> Result<Vec<u8>> {
         use sha2::Digest;
 
-        const ID_SHA256: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
-        const ID_SHA384: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
-        const ID_SHA512: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
-
         match *alg_oid {
-            ID_SHA256 => Ok(sha2::Sha256::digest(data).to_vec()),
-            ID_SHA384 => Ok(sha2::Sha384::digest(data).to_vec()),
-            ID_SHA512 => Ok(sha2::Sha512::digest(data).to_vec()),
+            oid::SHA256 => Ok(sha2::Sha256::digest(data).to_vec()),
+            oid::SHA384 => Ok(sha2::Sha384::digest(data).to_vec()),
+            oid::SHA512 => Ok(sha2::Sha512::digest(data).to_vec()),
             _ => Err(Error::Audit(format!(
                 "Unsupported digest algorithm: {}",
                 alg_oid
@@ -576,12 +608,7 @@ impl Rfc3161Client {
     ) -> Result<(DateTime<Utc>, x509_cert::Certificate, Vec<x509_cert::Certificate>)> {
         use cms::content_info::ContentInfo;
         use cms::signed_data::SignedData;
-        use der::oid::ObjectIdentifier;
         use der::{Decode, Encode};
-
-        const ID_SIGNED_DATA: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
-        const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
         let tsp_resp = rfc3161::TimeStampResp::from_der(response_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse TimeStampResp: {}", e)))?;
@@ -603,7 +630,7 @@ impl Rfc3161Client {
         let content_info = ContentInfo::from_der(&token_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse ContentInfo: {}", e)))?;
 
-        if content_info.content_type != ID_SIGNED_DATA {
+        if content_info.content_type != oid::SIGNED_DATA {
             return Err(Error::Audit("TimeStampToken is not SignedData".into()));
         }
 
@@ -622,7 +649,7 @@ impl Rfc3161Client {
         let tst_info = rfc3161::TstInfo::from_der(tst_info_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse TSTInfo: {}", e)))?;
 
-        if tst_info.message_imprint.hash_algorithm.oid != ID_SHA256 {
+        if tst_info.message_imprint.hash_algorithm.oid != oid::SHA256 {
             return Err(Error::Audit(
                 "TSTInfo uses unexpected hash algorithm".into(),
             ));
@@ -666,9 +693,6 @@ impl Rfc3161Client {
         use cms::signed_data::SignerIdentifier;
         use der::{Decode, Encode};
 
-        const ID_SUBJECT_KEY_ID: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.5.29.14");
-
         let mut chain_certs = Vec::new();
         let mut signer_cert = None;
 
@@ -694,7 +718,7 @@ impl Rfc3161Client {
                     .as_ref()
                     .map_or(false, |exts| {
                         exts.iter().any(|ext| {
-                            ext.extn_id == ID_SUBJECT_KEY_ID
+                            ext.extn_id == oid::SUBJECT_KEY_ID
                                 && ext.extn_value.as_bytes() == skid.0.as_bytes()
                         })
                     }),
@@ -718,27 +742,7 @@ impl Rfc3161Client {
         signer_info: &cms::signed_data::SignerInfo,
         cert: &x509_cert::Certificate,
     ) -> Result<()> {
-        use der::oid::ObjectIdentifier;
         use der::Encode;
-
-        const ID_RSA_ENCRYPTION: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-        const ID_RSA_SHA256: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-        const ID_RSA_SHA384: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
-        const ID_RSA_SHA512: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
-        const ID_ECDSA_SHA256: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-        const ID_ECDSA_SHA384: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
-        const ID_RSA_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-        const ID_EC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
-        const ID_SECP256R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-        const ID_SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
-        const ID_MESSAGE_DIGEST: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 
         let content_to_hash = match signer_info.signed_attrs {
             Some(ref signed_attrs) => signed_attrs
@@ -758,9 +762,9 @@ impl Rfc3161Client {
         let sig_alg = &signer_info.signature_algorithm.oid;
         let is_rsa = matches!(
             *sig_alg,
-            ID_RSA_ENCRYPTION | ID_RSA_SHA256 | ID_RSA_SHA384 | ID_RSA_SHA512
+            oid::RSA_ENCRYPTION | oid::RSA_SHA256 | oid::RSA_SHA384 | oid::RSA_SHA512
         );
-        let is_ecdsa = matches!(*sig_alg, ID_ECDSA_SHA256 | ID_ECDSA_SHA384);
+        let is_ecdsa = matches!(*sig_alg, oid::ECDSA_SHA256 | oid::ECDSA_SHA384);
 
         if !is_rsa && !is_ecdsa {
             return Err(Error::Audit(format!(
@@ -774,7 +778,6 @@ impl Rfc3161Client {
                 signed_attrs,
                 signed_data,
                 &signer_info.digest_alg.oid,
-                ID_MESSAGE_DIGEST,
             )?;
         }
 
@@ -782,19 +785,19 @@ impl Rfc3161Client {
         let signature_bytes = signer_info.signature.as_bytes();
         let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
 
-        if pubkey_info.algorithm.oid == ID_RSA_KEY {
+        if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
             self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg)?;
-        } else if pubkey_info.algorithm.oid == ID_EC_KEY {
+        } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
                 .parameters
                 .as_ref()
-                .and_then(|p| p.decode_as::<ObjectIdentifier>().ok())
+                .and_then(|p| p.decode_as::<der::oid::ObjectIdentifier>().ok())
                 .ok_or_else(|| Error::Audit("Missing EC curve parameter".into()))?;
 
-            if curve_oid == ID_SECP256R1 {
+            if curve_oid == oid::SECP256R1 {
                 self.verify_p256_signature(pubkey_bytes, &digest, signature_bytes)?;
-            } else if curve_oid == ID_SECP384R1 {
+            } else if curve_oid == oid::SECP384R1 {
                 self.verify_p384_signature(pubkey_bytes, &digest, signature_bytes)?;
             } else {
                 return Err(Error::Audit(format!("Unsupported EC curve: {}", curve_oid)));
@@ -814,10 +817,9 @@ impl Rfc3161Client {
         signed_attrs: &cms::signed_data::SignedAttributes,
         signed_data: &cms::signed_data::SignedData,
         digest_alg_oid: &der::oid::ObjectIdentifier,
-        id_message_digest: der::oid::ObjectIdentifier,
     ) -> Result<()> {
         for attr in signed_attrs.iter() {
-            if attr.oid != id_message_digest {
+            if attr.oid != oid::MESSAGE_DIGEST {
                 continue;
             }
 
@@ -862,15 +864,6 @@ impl Rfc3161Client {
         use der::Decode;
         use rsa::{pkcs1v15::Pkcs1v15Sign, RsaPublicKey};
 
-        const ID_RSA_ENCRYPTION: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-        const ID_RSA_SHA256: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-        const ID_RSA_SHA384: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
-        const ID_RSA_SHA512: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
-
         let rsa_pubkey_parsed = rsa::pkcs1::RsaPublicKey::from_der(pubkey_der)
             .map_err(|e| Error::Audit(format!("Failed to parse RSA public key: {}", e)))?;
         let rsa_pubkey = RsaPublicKey::new(
@@ -880,9 +873,9 @@ impl Rfc3161Client {
         .map_err(|e| Error::Audit(format!("Invalid RSA public key: {}", e)))?;
 
         let scheme = match *sig_alg {
-            ID_RSA_ENCRYPTION | ID_RSA_SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
-            ID_RSA_SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
-            ID_RSA_SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
+            oid::RSA_ENCRYPTION | oid::RSA_SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
+            oid::RSA_SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
+            oid::RSA_SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
             _ => {
                 return Err(Error::Audit(format!(
                     "Unsupported RSA signature algorithm: {}",
@@ -1007,11 +1000,6 @@ impl Rfc3161Client {
     fn validate_timestamping_eku(&self, cert: &x509_cert::Certificate) -> Result<()> {
         use der::Decode;
 
-        const ID_EXT_KEY_USAGE: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.5.29.37");
-        const ID_TSA_EKU: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
-
         let extensions = cert
             .tbs_certificate
             .extensions
@@ -1020,7 +1008,7 @@ impl Rfc3161Client {
 
         let eku_ext = extensions
             .iter()
-            .find(|ext| ext.extn_id == ID_EXT_KEY_USAGE)
+            .find(|ext| ext.extn_id == oid::EXT_KEY_USAGE)
             .ok_or_else(|| {
                 Error::Audit("TSA certificate missing Extended Key Usage extension".into())
             })?;
@@ -1031,7 +1019,7 @@ impl Rfc3161Client {
             )
             .map_err(|e| Error::Audit(format!("Failed to parse EKU: {}", e)))?;
 
-        if eku_seq.iter().any(|oid| *oid == ID_TSA_EKU) {
+        if eku_seq.iter().any(|o| *o == oid::TSA_EKU) {
             Ok(())
         } else {
             Err(Error::Audit(
@@ -1087,9 +1075,6 @@ impl Rfc3161Client {
     ) -> Result<()> {
         use der::Decode;
 
-        const ID_BASIC_CONSTRAINTS: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.5.29.19");
-
         #[derive(der::Sequence)]
         struct BasicConstraints {
             #[asn1(default = "default_false")]
@@ -1113,7 +1098,7 @@ impl Rfc3161Client {
 
         let bc_ext = extensions
             .iter()
-            .find(|ext| ext.extn_id == ID_BASIC_CONSTRAINTS);
+            .find(|ext| ext.extn_id == oid::BASIC_CONSTRAINTS);
 
         match bc_ext {
             Some(ext) => {
@@ -1141,8 +1126,6 @@ impl Rfc3161Client {
     ) -> Result<()> {
         use der::Decode;
 
-        const ID_KEY_USAGE: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("2.5.29.15");
         const DIGITAL_SIGNATURE: u8 = 0x80;
         const KEY_CERT_SIGN: u8 = 0x04;
 
@@ -1150,7 +1133,7 @@ impl Rfc3161Client {
             return Ok(());
         };
 
-        let Some(ku_ext) = extensions.iter().find(|ext| ext.extn_id == ID_KEY_USAGE) else {
+        let Some(ku_ext) = extensions.iter().find(|ext| ext.extn_id == oid::KEY_USAGE) else {
             return Ok(());
         };
 
@@ -1185,25 +1168,6 @@ impl Rfc3161Client {
         use der::Encode;
         use sha2::Digest;
 
-        const ID_RSA_KEY: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-        const ID_EC_KEY: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
-        const ID_RSA_SHA256: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-        const ID_RSA_SHA384: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
-        const ID_RSA_SHA512: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
-        const ID_ECDSA_SHA256: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-        const ID_ECDSA_SHA384: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
-        const ID_SECP256R1: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-        const ID_SECP384R1: der::oid::ObjectIdentifier =
-            der::oid::ObjectIdentifier::new_unwrap("1.3.132.0.34");
-
         let tbs_bytes = cert
             .tbs_certificate
             .to_der()
@@ -1214,11 +1178,11 @@ impl Rfc3161Client {
         let pubkey_info = &issuer.tbs_certificate.subject_public_key_info;
         let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
 
-        if pubkey_info.algorithm.oid == ID_RSA_KEY {
+        if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
             let digest = match *sig_alg {
-                ID_RSA_SHA256 => sha2::Sha256::digest(&tbs_bytes).to_vec(),
-                ID_RSA_SHA384 => sha2::Sha384::digest(&tbs_bytes).to_vec(),
-                ID_RSA_SHA512 => sha2::Sha512::digest(&tbs_bytes).to_vec(),
+                oid::RSA_SHA256 => sha2::Sha256::digest(&tbs_bytes).to_vec(),
+                oid::RSA_SHA384 => sha2::Sha384::digest(&tbs_bytes).to_vec(),
+                oid::RSA_SHA512 => sha2::Sha512::digest(&tbs_bytes).to_vec(),
                 _ => {
                     return Err(Error::Audit(format!(
                         "Unsupported certificate signature algorithm: {}",
@@ -1227,7 +1191,7 @@ impl Rfc3161Client {
                 }
             };
             self.verify_rsa_signature(pubkey_bytes, &digest, signature_bytes, sig_alg)?;
-        } else if pubkey_info.algorithm.oid == ID_EC_KEY {
+        } else if pubkey_info.algorithm.oid == oid::EC_KEY {
             let curve_oid = pubkey_info
                 .algorithm
                 .parameters
@@ -1236,11 +1200,11 @@ impl Rfc3161Client {
                 .ok_or_else(|| Error::Audit("Missing EC curve parameter".into()))?;
 
             match (curve_oid, *sig_alg) {
-                (c, s) if c == ID_SECP256R1 && s == ID_ECDSA_SHA256 => {
+                (c, s) if c == oid::SECP256R1 && s == oid::ECDSA_SHA256 => {
                     let digest = sha2::Sha256::digest(&tbs_bytes).to_vec();
                     self.verify_p256_signature(pubkey_bytes, &digest, signature_bytes)?;
                 }
-                (c, s) if c == ID_SECP384R1 && s == ID_ECDSA_SHA384 => {
+                (c, s) if c == oid::SECP384R1 && s == oid::ECDSA_SHA384 => {
                     let digest = sha2::Sha384::digest(&tbs_bytes).to_vec();
                     self.verify_p384_signature(pubkey_bytes, &digest, signature_bytes)?;
                 }
