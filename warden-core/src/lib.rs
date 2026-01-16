@@ -16,6 +16,7 @@ pub mod notification;
 pub mod pattern;
 pub mod policy;
 pub mod quorum;
+pub mod retry;
 pub mod risk;
 pub mod secrets;
 pub mod ssrf;
@@ -32,8 +33,8 @@ pub use approval::{
 #[cfg(any(test, feature = "mock"))]
 pub use backend::MockSigningBackend;
 pub use backend::{
-    BackendRegistry, HealthStatus, SessionId, SessionStatus, SigningBackend, SigningPayload,
-    SigningRequest, SigningSession, StubKeepBackend,
+    BackendRegistry, HealthStatus, RetryingSigningBackend, SessionId, SessionStatus,
+    SigningBackend, SigningPayload, SigningRequest, SigningSession, StubKeepBackend,
 };
 pub use config::Config;
 pub use error::{Error, Result};
@@ -60,6 +61,7 @@ pub use quorum::{
     GroupId, PendingGroupInfo, QuorumEvaluator, QuorumStatus, QuorumValidationError,
     RequirementNode,
 };
+pub use retry::{ClassifyError, ErrorKind, RetryDecision, TieredRetryPolicy};
 pub use risk::{RiskConfig, RiskEngine, RiskFactors, RiskLevel, RiskScore};
 pub use store::{
     AddressEntry, AddressListStore, DbCipher, InMemoryAddressListStore, InMemoryPolicyStore,
@@ -93,7 +95,7 @@ pub use compliance::{
     AlertSeverity as ComplianceAlertSeverity, ChainalysisClient, ChainalysisConfig,
     ComplianceAlert, ComplianceCallbackHandler, ComplianceError, ComplianceProvider,
     EllipticClient, EllipticConfig, ExposureCategory, ExposureInfo, MockComplianceProvider,
-    ScreeningResult,
+    RetryingComplianceProvider, ScreeningResult,
 };
 #[cfg(any(test, feature = "mock"))]
 pub use enclave::MockEnclaveClient;

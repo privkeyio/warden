@@ -1591,7 +1591,6 @@ mod production_hardening {
             public_key: Some("-----BEGIN PUBLIC KEY-----...".into()),
             timeout_seconds: 30,
             enabled: true,
-            max_retries: 3,
         };
 
         assert!(config.enabled);
@@ -1623,7 +1622,6 @@ mod production_hardening {
             public_key: None,
             timeout_seconds: 30,
             enabled: true,
-            max_retries: 3,
         });
 
         let handler = gateway.get_handler("handler-1");

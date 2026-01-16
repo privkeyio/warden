@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::retry::{ClassifyError, ErrorKind, RetryDecision, TieredRetryPolicy};
+
 const JTI_CACHE_TTL_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +90,6 @@ pub struct CallbackHandlerConfig {
     pub public_key: Option<String>,
     pub timeout_seconds: u32,
     pub enabled: bool,
-    pub max_retries: u32,
 }
 
 impl Default for CallbackHandlerConfig {
@@ -99,7 +100,6 @@ impl Default for CallbackHandlerConfig {
             public_key: None,
             timeout_seconds: 30,
             enabled: true,
-            max_retries: 3,
         }
     }
 }
@@ -128,9 +128,21 @@ pub enum CallbackError {
     SerializationError(String),
 }
 
-impl CallbackError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::HttpError(_) | Self::Timeout)
+impl ClassifyError for CallbackError {
+    fn error_kind(&self) -> ErrorKind {
+        match self {
+            Self::Timeout => ErrorKind::Timeout,
+            Self::HttpError(msg) if msg.contains("429") => ErrorKind::RateLimited,
+            Self::HttpError(_) => ErrorKind::Transient,
+            Self::HandlerNotFound(_) => ErrorKind::NotFound,
+            Self::HandlerDisabled(_) => ErrorKind::Permanent,
+            Self::JtiMismatch => ErrorKind::InvalidArgument,
+            Self::JtiReplay => ErrorKind::Permanent,
+            Self::InvalidAudience => ErrorKind::InvalidArgument,
+            Self::InvalidSignature => ErrorKind::Unauthorized,
+            Self::MaxRetriesExceeded => ErrorKind::Permanent,
+            Self::SerializationError(_) => ErrorKind::InvalidArgument,
+        }
     }
 }
 
@@ -248,7 +260,7 @@ impl CallbackJtiCache {
 pub struct CallbackGateway {
     http_client: reqwest::Client,
     handlers: HashMap<String, CallbackHandlerConfig>,
-    max_retries: u32,
+    retry_policy: TieredRetryPolicy,
     jws_verifier: JwsVerifier,
     jti_cache: Arc<CallbackJtiCache>,
 }
@@ -258,7 +270,7 @@ impl CallbackGateway {
         Self {
             http_client: reqwest::Client::new(),
             handlers: HashMap::new(),
-            max_retries: 3,
+            retry_policy: TieredRetryPolicy::default(),
             jws_verifier: JwsVerifier::new(),
             jti_cache: Arc::new(CallbackJtiCache::new(10000)),
         }
@@ -266,6 +278,11 @@ impl CallbackGateway {
 
     pub fn with_handler(mut self, config: CallbackHandlerConfig) -> Self {
         self.handlers.insert(config.id.clone(), config);
+        self
+    }
+
+    pub fn with_retry_policy(mut self, policy: TieredRetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -307,11 +324,9 @@ impl CallbackGateway {
         let request_json = serde_json::to_string(&request)
             .map_err(|e| CallbackError::SerializationError(e.to_string()))?;
 
-        let mut attempts = 0;
-        let max_retries = handler.max_retries.min(self.max_retries);
-        let mut last_error = None;
+        let mut attempt = 0u32;
 
-        while attempts < max_retries {
+        loop {
             let start = std::time::Instant::now();
 
             match self
@@ -327,18 +342,18 @@ impl CallbackGateway {
                         latency_ms: start.elapsed().as_millis() as u64,
                     });
                 }
-                Err(e) if e.is_retryable() => {
-                    last_error = Some(e);
-                    attempts += 1;
-
-                    let delay = Duration::from_millis(100 * 2u64.pow(attempts));
-                    tokio::time::sleep(delay).await;
+                Err(e) => {
+                    let error_kind = e.error_kind();
+                    match self.retry_policy.should_retry(error_kind, attempt) {
+                        RetryDecision::Retry { after } => {
+                            attempt += 1;
+                            tokio::time::sleep(after).await;
+                        }
+                        RetryDecision::Abort => return Err(e),
+                    }
                 }
-                Err(e) => return Err(e),
             }
         }
-
-        Err(last_error.unwrap_or(CallbackError::MaxRetriesExceeded))
     }
 
     async fn send_request(
@@ -354,7 +369,7 @@ impl CallbackGateway {
             .post(&handler.url)
             .header("Content-Type", "application/json")
             .header("X-Warden-Request-Id", expected_jti)
-            .body(request_json.to_string())
+            .body(request_json.to_owned())
             .timeout(timeout)
             .send()
             .await
@@ -524,9 +539,10 @@ mod tests {
         let payload = r#"{"decision":"APPROVE"}"#;
         let jws = create_test_jws(payload, &secret_key);
 
-        let parts: Vec<&str> = jws.split('.').collect();
+        let mut parts: Vec<&str> = jws.split('.').collect();
         let tampered_payload = URL_SAFE_NO_PAD.encode(r#"{"decision":"REJECT"}"#.as_bytes());
-        let tampered_jws = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+        parts[1] = &tampered_payload;
+        let tampered_jws = parts.join(".");
 
         let verifier = JwsVerifier::new();
         let result = verifier.verify(&tampered_jws, &public_key_hex);
@@ -543,7 +559,6 @@ mod tests {
         let result = verifier.verify("only-one-part", "deadbeef");
         assert!(matches!(result, Err(CallbackError::InvalidSignature)));
 
-        // Empty parts
         let result = verifier.verify("..", &hex::encode([0u8; 32]));
         assert!(matches!(result, Err(CallbackError::InvalidSignature)));
     }
@@ -592,7 +607,6 @@ mod tests {
         let payload = r#"{"decision":"APPROVE"}"#;
         let jws = create_test_jws(payload, &secret_key);
 
-        // Tamper header to claim different algorithm
         let tampered_header = JwsHeader {
             alg: "RS256".into(),
             kid: None,
@@ -600,8 +614,9 @@ mod tests {
         let tampered_header_b64 =
             URL_SAFE_NO_PAD.encode(serde_json::to_string(&tampered_header).unwrap().as_bytes());
 
-        let parts: Vec<&str> = jws.split('.').collect();
-        let tampered_jws = format!("{}.{}.{}", tampered_header_b64, parts[1], parts[2]);
+        let mut parts: Vec<&str> = jws.split('.').collect();
+        parts[0] = &tampered_header_b64;
+        let tampered_jws = parts.join(".");
 
         let verifier = JwsVerifier::new();
         let result = verifier.verify(&tampered_jws, &public_key_hex);
@@ -621,12 +636,18 @@ mod tests {
 
     #[test]
     fn test_callback_error_retryable() {
-        assert!(CallbackError::Timeout.is_retryable());
-        assert!(CallbackError::HttpError("connection failed".into()).is_retryable());
-        assert!(!CallbackError::JtiMismatch.is_retryable());
-        assert!(!CallbackError::JtiReplay.is_retryable());
-        assert!(!CallbackError::InvalidAudience.is_retryable());
-        assert!(!CallbackError::InvalidSignature.is_retryable());
+        assert!(ClassifyError::is_retryable(&CallbackError::Timeout));
+        assert!(ClassifyError::is_retryable(&CallbackError::HttpError(
+            "connection failed".into()
+        )));
+        assert!(!ClassifyError::is_retryable(&CallbackError::JtiMismatch));
+        assert!(!ClassifyError::is_retryable(&CallbackError::JtiReplay));
+        assert!(!ClassifyError::is_retryable(
+            &CallbackError::InvalidAudience
+        ));
+        assert!(!ClassifyError::is_retryable(
+            &CallbackError::InvalidSignature
+        ));
     }
 
     #[test]
@@ -634,7 +655,6 @@ mod tests {
         let config = CallbackHandlerConfig::default();
         assert!(config.enabled);
         assert_eq!(config.timeout_seconds, 30);
-        assert_eq!(config.max_retries, 3);
     }
 
     #[test]
