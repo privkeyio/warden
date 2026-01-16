@@ -12,8 +12,10 @@ pub mod error;
 pub mod escalation;
 pub mod evaluator;
 pub mod group;
+pub mod lifecycle;
 pub mod notification;
 pub mod pattern;
+pub mod permit;
 pub mod policy;
 pub mod quorum;
 pub mod retry;
@@ -115,5 +117,10 @@ pub use secrets::{
     AwsSecretsManagerConfig, AwsSecretsManagerProvider, CompositeSecretsProvider,
     EnvSecretsProvider, SecretRef, SecretValue, SecretsError, SecretsProvider, VaultConfig,
     VaultSecretsProvider,
+};
+pub use lifecycle::{LifecycleComponent, ServiceLifecycle};
+pub use permit::{
+    ClosableOwnedPermit, ClosablePermitDealer, OwnedPermit, PermitDealer, QuotaError,
+    SemaphoreSlotSupplier, SlotSupplier,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
