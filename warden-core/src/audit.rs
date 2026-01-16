@@ -110,6 +110,45 @@ mod base64_serde {
     }
 }
 
+mod oid {
+    use der::oid::ObjectIdentifier;
+
+    // Hash algorithm OIDs
+    pub const SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    pub const SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+    pub const SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
+
+    // RSA signature algorithm OIDs
+    pub const RSA_ENCRYPTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    pub const RSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+    pub const RSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+    pub const RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+
+    // ECDSA signature algorithm OIDs
+    pub const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    pub const ECDSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+
+    // Key type OIDs
+    pub const EC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+    // EC curve OIDs
+    pub const SECP256R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+    pub const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+
+    // CMS/PKCS#7 OIDs
+    pub const SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+    pub const MESSAGE_DIGEST: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
+    // X.509 extension OIDs
+    pub const SUBJECT_KEY_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
+    pub const KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+    pub const BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+    pub const EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
+    pub const TSA_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+}
+
 mod rfc3161 {
     use der::asn1::{GeneralizedTime, OctetString};
     use der::Sequence;
@@ -524,11 +563,7 @@ impl Rfc3161Client {
             .await
             .map_err(|e| Error::Audit(format!("Failed to read TSA response: {}", e)))?;
 
-        let (gen_time, signer_cert) = self.validate_timestamp_response(&token_bytes, hash)?;
-
-        if !self.trusted_roots.is_empty() {
-            self.validate_certificate_chain(&signer_cert)?;
-        }
+        let (gen_time, _signer_cert) = self.validate_timestamp_response(&token_bytes, hash)?;
 
         Ok(Rfc3161Token {
             tsa_url: self.tsa_url.clone(),
@@ -542,9 +577,41 @@ impl Rfc3161Client {
         response_bytes: &[u8],
         expected_hash: &Hash,
     ) -> Result<(DateTime<Utc>, x509_cert::Certificate)> {
+        let (gen_time, signer_cert, chain_certs) =
+            self.validate_timestamp_response_with_chain(response_bytes, expected_hash)?;
+
+        if !self.trusted_roots.is_empty() {
+            self.validate_certificate_chain(&signer_cert, &chain_certs, gen_time)?;
+        }
+
+        Ok((gen_time, signer_cert))
+    }
+
+    fn compute_digest(&self, alg_oid: &der::oid::ObjectIdentifier, data: &[u8]) -> Result<Vec<u8>> {
+        use sha2::Digest;
+
+        match *alg_oid {
+            oid::SHA256 => Ok(sha2::Sha256::digest(data).to_vec()),
+            oid::SHA384 => Ok(sha2::Sha384::digest(data).to_vec()),
+            oid::SHA512 => Ok(sha2::Sha512::digest(data).to_vec()),
+            _ => Err(Error::Audit(format!(
+                "Unsupported digest algorithm: {}",
+                alg_oid
+            ))),
+        }
+    }
+
+    fn validate_timestamp_response_with_chain(
+        &self,
+        response_bytes: &[u8],
+        expected_hash: &Hash,
+    ) -> Result<(
+        DateTime<Utc>,
+        x509_cert::Certificate,
+        Vec<x509_cert::Certificate>,
+    )> {
         use cms::content_info::ContentInfo;
         use cms::signed_data::SignedData;
-        use der::oid::ObjectIdentifier;
         use der::{Decode, Encode};
 
         let tsp_resp = rfc3161::TimeStampResp::from_der(response_bytes)
@@ -567,9 +634,7 @@ impl Rfc3161Client {
         let content_info = ContentInfo::from_der(&token_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse ContentInfo: {}", e)))?;
 
-        const ID_SIGNED_DATA: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
-        if content_info.content_type != ID_SIGNED_DATA {
+        if content_info.content_type != oid::SIGNED_DATA {
             return Err(Error::Audit("TimeStampToken is not SignedData".into()));
         }
 
@@ -578,19 +643,17 @@ impl Rfc3161Client {
             .decode_as::<SignedData>()
             .map_err(|e| Error::Audit(format!("Failed to parse SignedData: {}", e)))?;
 
-        let encap_content = signed_data
+        let tst_info_bytes = signed_data
             .encap_content_info
             .econtent
             .as_ref()
-            .ok_or_else(|| Error::Audit("SignedData missing encapsulated content".into()))?;
-
-        let tst_info_bytes = encap_content.value();
+            .ok_or_else(|| Error::Audit("SignedData missing encapsulated content".into()))?
+            .value();
 
         let tst_info = rfc3161::TstInfo::from_der(tst_info_bytes)
             .map_err(|e| Error::Audit(format!("Failed to parse TSTInfo: {}", e)))?;
 
-        const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
-        if tst_info.message_imprint.hash_algorithm.oid != ID_SHA256 {
+        if tst_info.message_imprint.hash_algorithm.oid != oid::SHA256 {
             return Err(Error::Audit(
                 "TSTInfo uses unexpected hash algorithm".into(),
             ));
@@ -614,59 +677,72 @@ impl Rfc3161Client {
             .as_ref()
             .ok_or_else(|| Error::Audit("SignedData missing certificates".into()))?;
 
-        let signer_cert = self.find_signer_certificate(certs, signer_info)?;
+        let (signer_cert, chain_certs) =
+            self.find_signer_certificate_and_chain(certs, signer_info)?;
 
         self.verify_signature(&signed_data, signer_info, &signer_cert)?;
 
         let gen_time = self.parse_generalized_time(&tst_info.gen_time)?;
-
         self.validate_certificate_validity(&signer_cert, gen_time)?;
 
-        Ok((gen_time, signer_cert))
+        Ok((gen_time, signer_cert, chain_certs))
     }
 
-    fn find_signer_certificate(
+    fn find_signer_certificate_and_chain(
         &self,
         certs: &cms::signed_data::CertificateSet,
         signer_info: &cms::signed_data::SignerInfo,
-    ) -> Result<x509_cert::Certificate> {
+    ) -> Result<(x509_cert::Certificate, Vec<x509_cert::Certificate>)> {
         use cms::cert::CertificateChoices;
         use cms::signed_data::SignerIdentifier;
         use der::{Decode, Encode};
 
-        for cert_choice in certs.0.iter() {
-            if let CertificateChoices::Certificate(cert_inner) = cert_choice {
-                let cert_bytes = cert_inner
-                    .to_der()
-                    .map_err(|e| Error::Audit(format!("Failed to encode certificate: {}", e)))?;
-                let cert = x509_cert::Certificate::from_der(&cert_bytes)
-                    .map_err(|e| Error::Audit(format!("Failed to parse certificate: {}", e)))?;
+        let mut chain_certs = Vec::new();
+        let mut signer_cert = None;
 
-                match &signer_info.sid {
-                    SignerIdentifier::IssuerAndSerialNumber(issuer_serial) => {
-                        if cert.tbs_certificate.issuer == issuer_serial.issuer
-                            && cert.tbs_certificate.serial_number == issuer_serial.serial_number
-                        {
-                            return Ok(cert);
-                        }
-                    }
-                    SignerIdentifier::SubjectKeyIdentifier(skid) => {
-                        if let Some(extensions) = &cert.tbs_certificate.extensions {
-                            for ext in extensions.iter() {
-                                const ID_SUBJECT_KEY_ID: der::oid::ObjectIdentifier =
-                                    der::oid::ObjectIdentifier::new_unwrap("2.5.29.14");
-                                if ext.extn_id == ID_SUBJECT_KEY_ID
-                                    && ext.extn_value.as_bytes() == skid.0.as_bytes()
-                                {
-                                    return Ok(cert);
-                                }
-                            }
-                        }
-                    }
+        for cert_choice in certs.0.iter() {
+            let CertificateChoices::Certificate(cert_inner) = cert_choice else {
+                continue;
+            };
+
+            let cert_bytes = cert_inner
+                .to_der()
+                .map_err(|e| Error::Audit(format!("Failed to encode certificate: {}", e)))?;
+            let cert = x509_cert::Certificate::from_der(&cert_bytes)
+                .map_err(|e| Error::Audit(format!("Failed to parse certificate: {}", e)))?;
+
+            let is_signer = match &signer_info.sid {
+                SignerIdentifier::IssuerAndSerialNumber(issuer_serial) => {
+                    cert.tbs_certificate.issuer == issuer_serial.issuer
+                        && cert.tbs_certificate.serial_number == issuer_serial.serial_number
                 }
+                SignerIdentifier::SubjectKeyIdentifier(skid) => cert
+                    .tbs_certificate
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|exts| {
+                        exts.iter().any(|ext| {
+                            if ext.extn_id != oid::SUBJECT_KEY_ID {
+                                return false;
+                            }
+                            // Decode the DER-encoded OCTET STRING to get the actual SKID bytes
+                            der::asn1::OctetString::from_der(ext.extn_value.as_bytes())
+                                .map(|decoded| decoded.as_bytes() == skid.0.as_bytes())
+                                .unwrap_or(false)
+                        })
+                    }),
+            };
+
+            if is_signer {
+                signer_cert = Some(cert);
+            } else {
+                chain_certs.push(cert);
             }
         }
-        Err(Error::Audit("Signer certificate not found in token".into()))
+
+        let signer = signer_cert
+            .ok_or_else(|| Error::Audit("Signer certificate not found in token".into()))?;
+        Ok((signer, chain_certs))
     }
 
     fn verify_signature(
@@ -675,73 +751,31 @@ impl Rfc3161Client {
         signer_info: &cms::signed_data::SignerInfo,
         cert: &x509_cert::Certificate,
     ) -> Result<()> {
-        use der::oid::ObjectIdentifier;
         use der::Encode;
-        use sha2::Digest;
 
-        let content_to_hash = if let Some(ref signed_attrs) = signer_info.signed_attrs {
-            signed_attrs
+        let content_to_hash = match signer_info.signed_attrs {
+            Some(ref signed_attrs) => signed_attrs
                 .to_der()
-                .map_err(|e| Error::Audit(format!("Failed to encode signed attrs: {}", e)))?
-        } else {
-            signed_data
+                .map_err(|e| Error::Audit(format!("Failed to encode signed attrs: {}", e)))?,
+            None => signed_data
                 .encap_content_info
                 .econtent
                 .as_ref()
                 .ok_or_else(|| Error::Audit("Missing content to verify".into()))?
                 .value()
-                .to_vec()
+                .to_vec(),
         };
 
-        const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
-        const ID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
-        const ID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
-
-        let digest = match signer_info.digest_alg.oid {
-            ID_SHA256 => {
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&content_to_hash);
-                hasher.finalize().to_vec()
-            }
-            ID_SHA384 => {
-                let mut hasher = sha2::Sha384::new();
-                hasher.update(&content_to_hash);
-                hasher.finalize().to_vec()
-            }
-            ID_SHA512 => {
-                let mut hasher = sha2::Sha512::new();
-                hasher.update(&content_to_hash);
-                hasher.finalize().to_vec()
-            }
-            _ => {
-                return Err(Error::Audit(format!(
-                    "Unsupported digest algorithm: {}",
-                    signer_info.digest_alg.oid
-                )));
-            }
-        };
-
-        const ID_RSA_ENCRYPTION: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-        const ID_RSA_SHA256: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-        const ID_RSA_SHA384: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
-        const ID_RSA_SHA512: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
-        const ID_ECDSA_SHA256: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-        const ID_ECDSA_SHA384: ObjectIdentifier =
-            ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+        let digest = self.compute_digest(&signer_info.digest_alg.oid, &content_to_hash)?;
 
         let sig_alg = &signer_info.signature_algorithm.oid;
-        if *sig_alg != ID_RSA_ENCRYPTION
-            && *sig_alg != ID_RSA_SHA256
-            && *sig_alg != ID_RSA_SHA384
-            && *sig_alg != ID_RSA_SHA512
-            && *sig_alg != ID_ECDSA_SHA256
-            && *sig_alg != ID_ECDSA_SHA384
-        {
+        let is_rsa = matches!(
+            *sig_alg,
+            oid::RSA_ENCRYPTION | oid::RSA_SHA256 | oid::RSA_SHA384 | oid::RSA_SHA512
+        );
+        let is_ecdsa = matches!(*sig_alg, oid::ECDSA_SHA256 | oid::ECDSA_SHA384);
+
+        if !is_rsa && !is_ecdsa {
             return Err(Error::Audit(format!(
                 "Unsupported signature algorithm: {}",
                 sig_alg
@@ -749,62 +783,177 @@ impl Rfc3161Client {
         }
 
         if let Some(ref signed_attrs) = signer_info.signed_attrs {
-            const ID_MESSAGE_DIGEST: ObjectIdentifier =
-                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
-            let mut found_digest = false;
-            for attr in signed_attrs.iter() {
-                if attr.oid == ID_MESSAGE_DIGEST {
-                    if let Some(value) = attr.values.iter().next() {
-                        let attr_digest: der::asn1::OctetString = value
-                            .decode_as()
-                            .map_err(|e| Error::Audit(format!("Failed to decode digest: {}", e)))?;
-                        let encap_content = signed_data
-                            .encap_content_info
-                            .econtent
-                            .as_ref()
-                            .ok_or_else(|| Error::Audit("Missing encap content".into()))?;
-                        let content_bytes = encap_content.value();
-                        let content_digest = match signer_info.digest_alg.oid {
-                            ID_SHA256 => {
-                                let mut h = sha2::Sha256::new();
-                                h.update(content_bytes);
-                                h.finalize().to_vec()
-                            }
-                            ID_SHA384 => {
-                                let mut h = sha2::Sha384::new();
-                                h.update(content_bytes);
-                                h.finalize().to_vec()
-                            }
-                            ID_SHA512 => {
-                                let mut h = sha2::Sha512::new();
-                                h.update(content_bytes);
-                                h.finalize().to_vec()
-                            }
-                            _ => {
-                                return Err(Error::Audit("Unsupported digest algorithm".into()));
-                            }
-                        };
-                        if attr_digest.as_bytes() != content_digest.as_slice() {
-                            return Err(Error::Audit(
-                                "Message digest attribute does not match content".into(),
-                            ));
-                        }
-                        found_digest = true;
-                    }
-                }
-            }
-            if !found_digest {
-                return Err(Error::Audit(
-                    "Signed attributes missing message digest".into(),
-                ));
-            }
+            self.verify_message_digest_attribute(
+                signed_attrs,
+                signed_data,
+                &signer_info.digest_alg.oid,
+            )?;
         }
 
-        let _pubkey_info = &cert.tbs_certificate.subject_public_key_info;
-        let _signature = signer_info.signature.as_bytes();
-        let _digest = digest;
+        let pubkey_info = &cert.tbs_certificate.subject_public_key_info;
+        let signature_bytes = signer_info.signature.as_bytes();
+        let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
+
+        if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
+            self.verify_rsa_signature(
+                pubkey_bytes,
+                &digest,
+                signature_bytes,
+                sig_alg,
+                &signer_info.digest_alg.oid,
+            )?;
+        } else if pubkey_info.algorithm.oid == oid::EC_KEY {
+            let curve_oid = pubkey_info
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|p| p.decode_as::<der::oid::ObjectIdentifier>().ok())
+                .ok_or_else(|| Error::Audit("Missing EC curve parameter".into()))?;
+
+            if curve_oid == oid::SECP256R1 {
+                self.verify_p256_signature(pubkey_bytes, &digest, signature_bytes)?;
+            } else if curve_oid == oid::SECP384R1 {
+                self.verify_p384_signature(pubkey_bytes, &digest, signature_bytes)?;
+            } else {
+                return Err(Error::Audit(format!("Unsupported EC curve: {}", curve_oid)));
+            }
+        } else {
+            return Err(Error::Audit(format!(
+                "Unsupported public key algorithm: {}",
+                pubkey_info.algorithm.oid
+            )));
+        }
 
         Ok(())
+    }
+
+    fn verify_message_digest_attribute(
+        &self,
+        signed_attrs: &cms::signed_data::SignedAttributes,
+        signed_data: &cms::signed_data::SignedData,
+        digest_alg_oid: &der::oid::ObjectIdentifier,
+    ) -> Result<()> {
+        for attr in signed_attrs.iter() {
+            if attr.oid != oid::MESSAGE_DIGEST {
+                continue;
+            }
+
+            let Some(value) = attr.values.iter().next() else {
+                continue;
+            };
+
+            let attr_digest: der::asn1::OctetString = value
+                .decode_as()
+                .map_err(|e| Error::Audit(format!("Failed to decode digest: {}", e)))?;
+
+            let content_bytes = signed_data
+                .encap_content_info
+                .econtent
+                .as_ref()
+                .ok_or_else(|| Error::Audit("Missing encap content".into()))?
+                .value();
+
+            let content_digest = self.compute_digest(digest_alg_oid, content_bytes)?;
+
+            if attr_digest.as_bytes() != content_digest.as_slice() {
+                return Err(Error::Audit(
+                    "Message digest attribute does not match content".into(),
+                ));
+            }
+
+            return Ok(());
+        }
+
+        Err(Error::Audit(
+            "Signed attributes missing message digest".into(),
+        ))
+    }
+
+    fn verify_rsa_signature(
+        &self,
+        pubkey_der: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+        sig_alg: &der::oid::ObjectIdentifier,
+        digest_alg: &der::oid::ObjectIdentifier,
+    ) -> Result<()> {
+        use der::Decode;
+        use rsa::{pkcs1v15::Pkcs1v15Sign, RsaPublicKey};
+
+        let rsa_pubkey_parsed = rsa::pkcs1::RsaPublicKey::from_der(pubkey_der)
+            .map_err(|e| Error::Audit(format!("Failed to parse RSA public key: {}", e)))?;
+        let rsa_pubkey = RsaPublicKey::new(
+            rsa::BigUint::from_bytes_be(rsa_pubkey_parsed.modulus.as_bytes()),
+            rsa::BigUint::from_bytes_be(rsa_pubkey_parsed.public_exponent.as_bytes()),
+        )
+        .map_err(|e| Error::Audit(format!("Invalid RSA public key: {}", e)))?;
+
+        // When sig_alg is RSA_ENCRYPTION (key algorithm, not signature algorithm),
+        // use the digest algorithm to determine the PKCS#1v15 scheme
+        let scheme = match *sig_alg {
+            oid::RSA_ENCRYPTION => match *digest_alg {
+                oid::SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
+                oid::SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
+                oid::SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
+                _ => {
+                    return Err(Error::Audit(format!(
+                        "Unsupported digest algorithm for RSA signature: {}",
+                        digest_alg
+                    )));
+                }
+            },
+            oid::RSA_SHA256 => Pkcs1v15Sign::new::<sha2::Sha256>(),
+            oid::RSA_SHA384 => Pkcs1v15Sign::new::<sha2::Sha384>(),
+            oid::RSA_SHA512 => Pkcs1v15Sign::new::<sha2::Sha512>(),
+            _ => {
+                return Err(Error::Audit(format!(
+                    "Unsupported RSA signature algorithm: {}",
+                    sig_alg
+                )));
+            }
+        };
+
+        rsa_pubkey
+            .verify(scheme, digest, signature)
+            .map_err(|e| Error::Audit(format!("RSA signature verification failed: {}", e)))
+    }
+
+    fn verify_p256_signature(
+        &self,
+        pubkey_bytes: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+    ) -> Result<()> {
+        use p256::ecdsa::{Signature, VerifyingKey};
+        use signature::hazmat::PrehashVerifier;
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_bytes)
+            .map_err(|e| Error::Audit(format!("Failed to parse P-256 public key: {}", e)))?;
+        let sig = Signature::from_der(signature)
+            .map_err(|e| Error::Audit(format!("Failed to parse P-256 signature: {}", e)))?;
+
+        verifying_key
+            .verify_prehash(digest, &sig)
+            .map_err(|e| Error::Audit(format!("P-256 signature verification failed: {}", e)))
+    }
+
+    fn verify_p384_signature(
+        &self,
+        pubkey_bytes: &[u8],
+        digest: &[u8],
+        signature: &[u8],
+    ) -> Result<()> {
+        use p384::ecdsa::{Signature, VerifyingKey};
+        use signature::hazmat::PrehashVerifier;
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_bytes)
+            .map_err(|e| Error::Audit(format!("Failed to parse P-384 public key: {}", e)))?;
+        let sig = Signature::from_der(signature)
+            .map_err(|e| Error::Audit(format!("Failed to parse P-384 signature: {}", e)))?;
+
+        verifying_key
+            .verify_prehash(digest, &sig)
+            .map_err(|e| Error::Audit(format!("P-384 signature verification failed: {}", e)))
     }
 
     fn parse_generalized_time(
@@ -844,21 +993,273 @@ impl Rfc3161Client {
         Ok(())
     }
 
-    fn validate_certificate_chain(&self, signer_cert: &x509_cert::Certificate) -> Result<()> {
+    fn validate_certificate_chain(
+        &self,
+        signer_cert: &x509_cert::Certificate,
+        chain_certs: &[x509_cert::Certificate],
+        gen_time: DateTime<Utc>,
+    ) -> Result<()> {
         if self.trusted_roots.is_empty() {
             return Ok(());
         }
 
-        let signer_issuer = &signer_cert.tbs_certificate.issuer;
-        for root in &self.trusted_roots {
-            if &root.tbs_certificate.subject == signer_issuer {
-                return Ok(());
+        self.validate_timestamping_eku(signer_cert)?;
+
+        let chain = self.build_certificate_chain(signer_cert, chain_certs)?;
+        let chain_len = chain.len();
+
+        for (i, cert) in chain.iter().enumerate() {
+            let is_end_entity = i == 0;
+            let is_root = i == chain_len - 1;
+            let is_ca = !is_end_entity;
+
+            // Validate certificate validity (notBefore/notAfter) against genTime
+            self.validate_certificate_validity(cert, gen_time)?;
+
+            if is_ca {
+                self.validate_basic_constraints(cert, !is_root)?;
+            }
+
+            if !is_root {
+                self.verify_certificate_signature(cert, &chain[i + 1])?;
+            }
+
+            self.validate_key_usage_for_signing(cert, is_ca)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_timestamping_eku(&self, cert: &x509_cert::Certificate) -> Result<()> {
+        use der::Decode;
+
+        let extensions = cert
+            .tbs_certificate
+            .extensions
+            .as_ref()
+            .ok_or_else(|| Error::Audit("TSA certificate missing extensions".into()))?;
+
+        let eku_ext = extensions
+            .iter()
+            .find(|ext| ext.extn_id == oid::EXT_KEY_USAGE)
+            .ok_or_else(|| {
+                Error::Audit("TSA certificate missing Extended Key Usage extension".into())
+            })?;
+
+        let eku_seq = der::asn1::SequenceOf::<der::oid::ObjectIdentifier, 16>::from_der(
+            eku_ext.extn_value.as_bytes(),
+        )
+        .map_err(|e| Error::Audit(format!("Failed to parse EKU: {}", e)))?;
+
+        if eku_seq.iter().any(|o| *o == oid::TSA_EKU) {
+            Ok(())
+        } else {
+            Err(Error::Audit(
+                "TSA certificate missing timestamping EKU".into(),
+            ))
+        }
+    }
+
+    fn build_certificate_chain(
+        &self,
+        signer_cert: &x509_cert::Certificate,
+        chain_certs: &[x509_cert::Certificate],
+    ) -> Result<Vec<x509_cert::Certificate>> {
+        const MAX_CHAIN_LENGTH: usize = 10;
+
+        let mut chain = vec![signer_cert.clone()];
+        let mut available: Vec<_> = chain_certs.to_vec();
+
+        while chain.len() < MAX_CHAIN_LENGTH {
+            let current = chain.last().unwrap();
+            let issuer = &current.tbs_certificate.issuer;
+
+            if let Some(root) = self
+                .trusted_roots
+                .iter()
+                .find(|r| &r.tbs_certificate.subject == issuer)
+            {
+                chain.push(root.clone());
+                return Ok(chain);
+            }
+
+            let intermediate_idx = available
+                .iter()
+                .position(|c| &c.tbs_certificate.subject == issuer);
+
+            match intermediate_idx {
+                Some(idx) => chain.push(available.remove(idx)),
+                None => {
+                    return Err(Error::Audit(
+                        "Could not build certificate chain to trusted root".into(),
+                    ))
+                }
             }
         }
 
-        Err(Error::Audit(
-            "TSA certificate not issued by a trusted root".into(),
-        ))
+        Err(Error::Audit("Certificate chain too long".into()))
+    }
+
+    fn validate_basic_constraints(
+        &self,
+        cert: &x509_cert::Certificate,
+        must_be_ca: bool,
+    ) -> Result<()> {
+        use der::Decode;
+
+        #[derive(der::Sequence)]
+        struct BasicConstraints {
+            #[asn1(default = "default_false")]
+            ca: bool,
+            #[asn1(optional = "true")]
+            path_len_constraint: Option<u32>,
+        }
+
+        fn default_false() -> bool {
+            false
+        }
+
+        let Some(extensions) = &cert.tbs_certificate.extensions else {
+            if must_be_ca {
+                return Err(Error::Audit(
+                    "CA certificate missing Basic Constraints extension".into(),
+                ));
+            }
+            return Ok(());
+        };
+
+        let bc_ext = extensions
+            .iter()
+            .find(|ext| ext.extn_id == oid::BASIC_CONSTRAINTS);
+
+        match bc_ext {
+            Some(ext) => {
+                let bc = BasicConstraints::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    Error::Audit(format!("Failed to parse Basic Constraints: {}", e))
+                })?;
+
+                if must_be_ca && !bc.ca {
+                    return Err(Error::Audit("Intermediate certificate is not a CA".into()));
+                }
+                Ok(())
+            }
+            None if must_be_ca => Err(Error::Audit(
+                "CA certificate missing Basic Constraints extension".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_key_usage_for_signing(
+        &self,
+        cert: &x509_cert::Certificate,
+        is_ca: bool,
+    ) -> Result<()> {
+        use der::Decode;
+
+        const DIGITAL_SIGNATURE: u8 = 0x80;
+        const KEY_CERT_SIGN: u8 = 0x04;
+
+        let Some(extensions) = &cert.tbs_certificate.extensions else {
+            return Ok(());
+        };
+
+        let Some(ku_ext) = extensions.iter().find(|ext| ext.extn_id == oid::KEY_USAGE) else {
+            return Ok(());
+        };
+
+        let ku = der::asn1::BitString::from_der(ku_ext.extn_value.as_bytes())
+            .map_err(|e| Error::Audit(format!("Failed to parse Key Usage: {}", e)))?;
+
+        let ku_bytes = ku.raw_bytes();
+        if ku_bytes.is_empty() {
+            return Err(Error::Audit("Key Usage extension is empty".into()));
+        }
+
+        let usage = ku_bytes[0];
+        if is_ca && (usage & KEY_CERT_SIGN == 0) {
+            return Err(Error::Audit(
+                "CA certificate missing keyCertSign key usage".into(),
+            ));
+        }
+        if !is_ca && (usage & DIGITAL_SIGNATURE == 0) {
+            return Err(Error::Audit(
+                "End-entity certificate missing digitalSignature key usage".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_certificate_signature(
+        &self,
+        cert: &x509_cert::Certificate,
+        issuer: &x509_cert::Certificate,
+    ) -> Result<()> {
+        use der::Encode;
+        use sha2::Digest;
+
+        let tbs_bytes = cert
+            .tbs_certificate
+            .to_der()
+            .map_err(|e| Error::Audit(format!("Failed to encode TBS certificate: {}", e)))?;
+
+        let signature_bytes = cert.signature.raw_bytes();
+        let sig_alg = &cert.signature_algorithm.oid;
+        let pubkey_info = &issuer.tbs_certificate.subject_public_key_info;
+        let pubkey_bytes = pubkey_info.subject_public_key.raw_bytes();
+
+        if pubkey_info.algorithm.oid == oid::RSA_ENCRYPTION {
+            let (digest, digest_alg) = match *sig_alg {
+                oid::RSA_SHA256 => (sha2::Sha256::digest(&tbs_bytes).to_vec(), oid::SHA256),
+                oid::RSA_SHA384 => (sha2::Sha384::digest(&tbs_bytes).to_vec(), oid::SHA384),
+                oid::RSA_SHA512 => (sha2::Sha512::digest(&tbs_bytes).to_vec(), oid::SHA512),
+                _ => {
+                    return Err(Error::Audit(format!(
+                        "Unsupported certificate signature algorithm: {}",
+                        sig_alg
+                    )));
+                }
+            };
+            self.verify_rsa_signature(
+                pubkey_bytes,
+                &digest,
+                signature_bytes,
+                sig_alg,
+                &digest_alg,
+            )?;
+        } else if pubkey_info.algorithm.oid == oid::EC_KEY {
+            let curve_oid = pubkey_info
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|p| p.decode_as::<der::oid::ObjectIdentifier>().ok())
+                .ok_or_else(|| Error::Audit("Missing EC curve parameter".into()))?;
+
+            match (curve_oid, *sig_alg) {
+                (c, s) if c == oid::SECP256R1 && s == oid::ECDSA_SHA256 => {
+                    let digest = sha2::Sha256::digest(&tbs_bytes).to_vec();
+                    self.verify_p256_signature(pubkey_bytes, &digest, signature_bytes)?;
+                }
+                (c, s) if c == oid::SECP384R1 && s == oid::ECDSA_SHA384 => {
+                    let digest = sha2::Sha384::digest(&tbs_bytes).to_vec();
+                    self.verify_p384_signature(pubkey_bytes, &digest, signature_bytes)?;
+                }
+                _ => {
+                    return Err(Error::Audit(format!(
+                        "Unsupported EC curve/signature combination: {} / {}",
+                        curve_oid, sig_alg
+                    )));
+                }
+            }
+        } else {
+            return Err(Error::Audit(format!(
+                "Unsupported issuer public key algorithm: {}",
+                pubkey_info.algorithm.oid
+            )));
+        }
+
+        Ok(())
     }
 
     fn build_timestamp_request(&self, hash: &Hash) -> Vec<u8> {

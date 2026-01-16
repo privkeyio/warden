@@ -40,6 +40,11 @@ x509-cert = "0.2"
 der = "0.7"
 const-oid = "0.9"
 spki = "0.7"
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = "0.16"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+signature = "2"
 regex = "1"
 base64 = "0.22"
 reqwest = { version = "0.12.8", features = ["json"] }
