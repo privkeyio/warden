@@ -101,7 +101,9 @@ mod tests {
             max_delay: Duration::from_millis(10),
             backoff_multiplier: 2.0,
         });
-        service.register_sender(Arc::new(MockSender::failing_n_times(2))).await;
+        service
+            .register_sender(Arc::new(MockSender::failing_n_times(2)))
+            .await;
 
         let notification = Notification::ApprovalRequest(ApprovalRequestNotification {
             workflow_id: Uuid::new_v4(),

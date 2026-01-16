@@ -29,7 +29,10 @@ impl DepthTracker {
     }
 
     pub fn with_max_depth(max_depth: usize) -> Self {
-        Self { depth: 0, max_depth }
+        Self {
+            depth: 0,
+            max_depth,
+        }
     }
 
     pub fn enter(&mut self) -> Result<DepthGuard<'_>> {
@@ -224,7 +227,9 @@ impl PolicyEvaluator {
         );
 
         for rule in &policy.rules {
-            let match_result = self.evaluate_rule(rule, &context, &mut depth_tracker).await?;
+            let match_result = self
+                .evaluate_rule(rule, &context, &mut depth_tracker)
+                .await?;
 
             trace.push(RuleTraceEntry {
                 rule_id: rule.id.clone(),
