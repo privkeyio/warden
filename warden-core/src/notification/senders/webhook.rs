@@ -86,6 +86,12 @@ impl NotificationSender for WebhookSender {
         let secret = secret
             .ok_or_else(|| NotificationError::Permanent("webhook secret not configured".into()))?;
 
+        if secret.expose().len() < 32 {
+            return Err(NotificationError::Permanent(
+                "webhook secret must be at least 32 bytes".into(),
+            ));
+        }
+
         let timestamp = Utc::now().timestamp();
         let event_type = notification_type_name(notification);
         let payload = serde_json::to_string(notification)

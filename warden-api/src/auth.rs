@@ -9,7 +9,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU32,
@@ -73,9 +73,8 @@ pub struct JwtConfig {
 
 impl JwtConfig {
     pub fn new(secret: &[u8]) -> Self {
-        let mut validation = Validation::default();
+        let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
-        // Allow 30 seconds of clock skew tolerance
         validation.leeway = 30;
         Self {
             encoding_key: EncodingKey::from_secret(secret),
@@ -85,7 +84,7 @@ impl JwtConfig {
     }
 
     pub fn encode(&self, claims: &Claims) -> Result<String, jsonwebtoken::errors::Error> {
-        encode(&Header::default(), claims, &self.encoding_key)
+        encode(&Header::new(Algorithm::HS256), claims, &self.encoding_key)
     }
 
     pub fn decode(&self, token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
