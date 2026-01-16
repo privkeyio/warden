@@ -605,7 +605,11 @@ impl Rfc3161Client {
         &self,
         response_bytes: &[u8],
         expected_hash: &Hash,
-    ) -> Result<(DateTime<Utc>, x509_cert::Certificate, Vec<x509_cert::Certificate>)> {
+    ) -> Result<(
+        DateTime<Utc>,
+        x509_cert::Certificate,
+        Vec<x509_cert::Certificate>,
+    )> {
         use cms::content_info::ContentInfo;
         use cms::signed_data::SignedData;
         use der::{Decode, Encode};
@@ -1013,11 +1017,10 @@ impl Rfc3161Client {
                 Error::Audit("TSA certificate missing Extended Key Usage extension".into())
             })?;
 
-        let eku_seq =
-            der::asn1::SequenceOf::<der::oid::ObjectIdentifier, 16>::from_der(
-                eku_ext.extn_value.as_bytes(),
-            )
-            .map_err(|e| Error::Audit(format!("Failed to parse EKU: {}", e)))?;
+        let eku_seq = der::asn1::SequenceOf::<der::oid::ObjectIdentifier, 16>::from_der(
+            eku_ext.extn_value.as_bytes(),
+        )
+        .map_err(|e| Error::Audit(format!("Failed to parse EKU: {}", e)))?;
 
         if eku_seq.iter().any(|o| *o == oid::TSA_EKU) {
             Ok(())
@@ -1102,13 +1105,12 @@ impl Rfc3161Client {
 
         match bc_ext {
             Some(ext) => {
-                let bc = BasicConstraints::from_der(ext.extn_value.as_bytes())
-                    .map_err(|e| Error::Audit(format!("Failed to parse Basic Constraints: {}", e)))?;
+                let bc = BasicConstraints::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    Error::Audit(format!("Failed to parse Basic Constraints: {}", e))
+                })?;
 
                 if must_be_ca && !bc.ca {
-                    return Err(Error::Audit(
-                        "Intermediate certificate is not a CA".into(),
-                    ));
+                    return Err(Error::Audit("Intermediate certificate is not a CA".into()));
                 }
                 Ok(())
             }
