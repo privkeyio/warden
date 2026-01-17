@@ -210,7 +210,10 @@ impl TokenBlacklist {
     /// to this instance.
     ///
     /// Returns a `JoinHandle` that can be used to abort the task on shutdown.
-    pub fn start_sync_task(self: &Arc<Self>, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn start_sync_task(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let store = self.store.as_ref()?;
         let store = Arc::clone(store);
         let blacklist = Arc::clone(self);

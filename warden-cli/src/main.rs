@@ -536,9 +536,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rate_limit,
                         Arc::clone(store),
                     );
-                    let count = state.load_blacklist().await.map_err(|e| {
-                        format!("Failed to load revoked tokens from store: {}", e)
-                    })?;
+                    let count = state
+                        .load_blacklist()
+                        .await
+                        .map_err(|e| format!("Failed to load revoked tokens from store: {}", e))?;
                     if count > 0 {
                         tracing::info!(count, "Loaded revoked tokens from persistent store");
                     }
