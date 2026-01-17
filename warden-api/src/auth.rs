@@ -204,6 +204,44 @@ impl TokenBlacklist {
     pub fn is_empty(&self) -> bool {
         self.entries.read().is_empty()
     }
+
+    /// Spawns a background task that periodically syncs revoked tokens from the
+    /// persistent store. This ensures revocations from other nodes are visible
+    /// to this instance.
+    ///
+    /// Returns a `JoinHandle` that can be used to abort the task on shutdown.
+    pub fn start_sync_task(self: &Arc<Self>, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+        let store = self.store.as_ref()?;
+        let store = Arc::clone(store);
+        let blacklist = Arc::clone(self);
+
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                ticker.tick().await;
+
+                match store.list_valid().await {
+                    Ok(tokens) => {
+                        let mut entries = blacklist.entries.write();
+                        let mut added = 0usize;
+                        for token in tokens {
+                            if entries.insert(token.jti, token.exp).is_none() {
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            tracing::debug!(added, "Synced new revoked tokens from store");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to sync revoked tokens from store");
+                    }
+                }
+            }
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -487,6 +525,14 @@ impl AuthState {
 
     pub async fn load_blacklist(&self) -> Result<usize, String> {
         self.token_blacklist.load_from_store().await
+    }
+
+    /// Starts a background task that periodically syncs revoked tokens from the
+    /// persistent store. This ensures revocations from other nodes are visible.
+    ///
+    /// Returns a `JoinHandle` if a persistent store is configured, `None` otherwise.
+    pub fn start_blacklist_sync(&self, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+        self.token_blacklist.start_sync_task(interval)
     }
 
     pub fn check_rate_limit(&self) -> Result<(), AuthError> {

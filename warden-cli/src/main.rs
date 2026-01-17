@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "mock")]
 use warden_core::MockSigningBackend;
 use warden_core::{
@@ -535,15 +536,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rate_limit,
                         Arc::clone(store),
                     );
-                    match state.load_blacklist().await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(count, "Loaded revoked tokens from persistent store");
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to load revoked tokens from store");
-                        }
+                    let count = state.load_blacklist().await.map_err(|e| {
+                        format!("Failed to load revoked tokens from store: {}", e)
+                    })?;
+                    if count > 0 {
+                        tracing::info!(count, "Loaded revoked tokens from persistent store");
                     }
+
+                    // Start background sync to pick up revocations from other nodes
+                    let sync_interval = Duration::from_secs(30);
+                    if let Some(handle) = state.start_blacklist_sync(sync_interval) {
+                        tracing::info!(
+                            interval_secs = sync_interval.as_secs(),
+                            "Started blacklist sync task"
+                        );
+                        // The handle is dropped here, allowing the task to run detached.
+                        // In a production system, you might want to track this for graceful shutdown.
+                        drop(handle);
+                    }
+
                     state
                 }
                 None => warden_api::AuthState::new(jwt_secret.as_bytes(), rate_limit),
