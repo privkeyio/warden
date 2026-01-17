@@ -422,10 +422,14 @@ impl NormalizedCondition {
                 days_ok && hours_ok
             }
 
-            // And-vs-And: all conjuncts in self must be covered by some conjunct in other
-            (NormalizedCondition::And(a_parts), NormalizedCondition::And(b_parts)) => a_parts
-                .iter()
-                .all(|p| b_parts.iter().any(|q| p.is_subset_of(q))),
+            // And-vs-And: self is subset if every constraint in other is implied by some constraint in self
+            (NormalizedCondition::And(self_parts), NormalizedCondition::And(other_parts)) => {
+                other_parts.iter().all(|other_cond| {
+                    self_parts
+                        .iter()
+                        .any(|self_cond| self_cond.is_subset_of(other_cond))
+                })
+            }
 
             (NormalizedCondition::And(parts), other) => parts.iter().any(|p| p.is_subset_of(other)),
 
@@ -615,10 +619,11 @@ fn generate_counterexample(condition: &NormalizedCondition) -> Option<Counterexa
             ce.description = format!("amount {} sats", amount);
         }
         NormalizedCondition::SourceWallet { patterns } => {
-            if let Some(p) = patterns.first() {
-                let wallet = p
-                    .strip_suffix('*')
-                    .map_or_else(|| p.clone(), |prefix| format!("{prefix}example"));
+            if let Some(pattern) = patterns.first() {
+                let wallet = match pattern.strip_suffix('*') {
+                    Some(prefix) => format!("{prefix}example"),
+                    None => pattern.clone(),
+                };
                 ce.description = format!("source wallet '{wallet}'");
                 ce.source_wallet = Some(wallet);
             }
@@ -961,6 +966,72 @@ mod tests {
         };
 
         assert!(and_cond.is_subset_of(&amount_only));
+    }
+
+    #[test]
+    fn test_and_vs_and_extra_constraint_not_subset() {
+        // A = And(AmountRange 100-150)
+        // B = And(AmountRange 50-200, TimeWindow Mon)
+        // A request with amount=125 on Tuesday satisfies A but not B
+        // Therefore A is NOT a subset of B
+        let a = NormalizedCondition::And(vec![NormalizedCondition::AmountRange {
+            min: Some(100),
+            max: Some(150),
+        }]);
+        let b = NormalizedCondition::And(vec![
+            NormalizedCondition::AmountRange {
+                min: Some(50),
+                max: Some(200),
+            },
+            NormalizedCondition::TimeWindow {
+                days: Some([DayOfWeek::Mon].into_iter().collect()),
+                hours: None,
+            },
+        ]);
+
+        assert!(!a.is_subset_of(&b));
+    }
+
+    #[test]
+    fn test_and_vs_and_all_constraints_covered() {
+        // A = And(Amount 100-150, TimeWindow Mon, Wallet treasury-*)
+        // B = And(Amount 50-200, TimeWindow Mon-Fri)
+        // A has stricter constraints that cover all of B's constraints
+        let a = NormalizedCondition::And(vec![
+            NormalizedCondition::AmountRange {
+                min: Some(100),
+                max: Some(150),
+            },
+            NormalizedCondition::TimeWindow {
+                days: Some([DayOfWeek::Mon].into_iter().collect()),
+                hours: None,
+            },
+            NormalizedCondition::SourceWallet {
+                patterns: ["treasury-*".into()].into_iter().collect(),
+            },
+        ]);
+        let b = NormalizedCondition::And(vec![
+            NormalizedCondition::AmountRange {
+                min: Some(50),
+                max: Some(200),
+            },
+            NormalizedCondition::TimeWindow {
+                days: Some(
+                    [
+                        DayOfWeek::Mon,
+                        DayOfWeek::Tue,
+                        DayOfWeek::Wed,
+                        DayOfWeek::Thu,
+                        DayOfWeek::Fri,
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                hours: None,
+            },
+        ]);
+
+        assert!(a.is_subset_of(&b));
     }
 
     #[test]
