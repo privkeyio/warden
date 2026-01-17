@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 
@@ -506,29 +506,49 @@ impl<K: Eq + Hash + Clone + fmt::Debug> HierarchyValidator<K> {
 
     fn compute_depth<N: TCNode<K>>(&self, start: &K, nodes: &[N]) -> usize {
         let node_map: HashMap<K, &N> = nodes.iter().map(|n| (n.get_key(), n)).collect();
-        let mut max_depth = 0;
-        let mut queue = VecDeque::new();
-        queue.push_back((start.clone(), 0usize));
+        let mut memo: HashMap<K, usize> = HashMap::new();
+        let mut visiting: HashSet<K> = HashSet::new();
 
-        let mut visited = HashSet::new();
+        self.longest_from(start, &node_map, &mut memo, &mut visiting)
+    }
 
-        while let Some((current, depth)) = queue.pop_front() {
-            if visited.contains(&current) {
-                continue;
-            }
-            visited.insert(current.clone());
-            max_depth = max_depth.max(depth);
-
-            if let Some(node) = node_map.get(&current) {
-                for neighbor in node.out_edges() {
-                    if !visited.contains(neighbor) {
-                        queue.push_back((neighbor.clone(), depth + 1));
-                    }
-                }
-            }
+    fn longest_from<N: TCNode<K>>(
+        &self,
+        key: &K,
+        node_map: &HashMap<K, &N>,
+        memo: &mut HashMap<K, usize>,
+        visiting: &mut HashSet<K>,
+    ) -> usize {
+        if let Some(&depth) = memo.get(key) {
+            return depth;
         }
 
-        max_depth
+        if visiting.contains(key) {
+            // Cycle detected, return 0 to avoid infinite recursion
+            return 0;
+        }
+
+        visiting.insert(key.clone());
+
+        let depth = match node_map.get(key) {
+            Some(node) => {
+                let edges: Vec<_> = node.out_edges().collect();
+                if edges.is_empty() {
+                    0 // Sink node
+                } else {
+                    1 + edges
+                        .iter()
+                        .map(|child| self.longest_from(child, node_map, memo, visiting))
+                        .max()
+                        .unwrap_or(0)
+                }
+            }
+            None => 0, // Node not in map, treat as sink
+        };
+
+        visiting.remove(key);
+        memo.insert(key.clone(), depth);
+        depth
     }
 
     pub fn would_create_cycle(&self, from: &K, to: &K) -> bool {
