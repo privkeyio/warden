@@ -7,6 +7,7 @@ pub mod bundle;
 pub mod callback;
 pub mod compliance;
 pub mod config;
+pub mod context;
 pub mod enclave;
 pub mod error;
 pub mod escalation;
@@ -124,3 +125,7 @@ pub use secrets::{
     VaultSecretsProvider,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
+
+pub use context::{
+    BypassFlags, ContextRole, RequestContext, RequestExtensions, RetryOverride, TimeoutOverride,
+};
