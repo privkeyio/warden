@@ -13,13 +13,27 @@ use crate::Result;
 pub use memory::{InMemoryAddressListStore, InMemoryPolicyStore};
 pub use redb_store::{
     DbCipher, RedbAddressListStore, RedbApprovalStore, RedbGroupStore, RedbPolicyStore,
-    RedbStorage, RedbWorkflowStore,
+    RedbRevokedTokenStore, RedbStorage, RedbWorkflowStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressEntry {
     pub address: String,
     pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedToken {
+    pub jti: String,
+    pub exp: u64,
+}
+
+#[async_trait]
+pub trait RevokedTokenStore: Send + Sync {
+    async fn revoke(&self, jti: &str, exp: u64) -> Result<()>;
+    async fn is_revoked(&self, jti: &str) -> Result<bool>;
+    async fn list_valid(&self) -> Result<Vec<RevokedToken>>;
+    async fn cleanup_expired(&self) -> Result<usize>;
 }
 
 #[async_trait]

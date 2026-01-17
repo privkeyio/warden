@@ -9,8 +9,8 @@ use warden_core::{
     AddressListStore, ApprovalDecision, ApprovalStore, ApproverGroup, BackendRegistry, Config,
     EnclaveClient, EnclaveConfig, EnclaveProxy, GroupMember, GroupStore, InMemoryAddressListStore,
     InMemoryApprovalStore, InMemoryGroupStore, InMemoryPolicyStore, InMemoryWorkflowStore,
-    PcrConfig, Policy, PolicyEvaluator, PolicyStore, RedbStorage, TimeoutChecker,
-    TransactionRequest, WorkflowStore,
+    PcrConfig, Policy, PolicyEvaluator, PolicyStore, RedbStorage, RevokedTokenStore,
+    TimeoutChecker, TransactionRequest, WorkflowStore,
 };
 
 #[derive(Parser)]
@@ -192,6 +192,7 @@ struct Stores {
     workflow_store: Arc<dyn WorkflowStore>,
     group_store: Arc<dyn GroupStore>,
     backend_registry: Arc<BackendRegistry>,
+    revoked_token_store: Option<Arc<dyn RevokedTokenStore>>,
     _storage: Option<RedbStorage>,
 }
 
@@ -209,6 +210,7 @@ impl Stores {
             workflow_store: Arc::new(InMemoryWorkflowStore::new()),
             group_store: Arc::new(InMemoryGroupStore::new()),
             backend_registry,
+            revoked_token_store: None,
             _storage: None,
         }
     }
@@ -221,6 +223,9 @@ impl Stores {
         #[cfg(feature = "mock")]
         backend_registry.register(Arc::new(MockSigningBackend::new()));
 
+        let revoked_token_store: Arc<dyn RevokedTokenStore> =
+            Arc::new(storage.revoked_token_store());
+
         Ok(Self {
             policy_store: Arc::new(storage.policy_store()),
             whitelist_store: Arc::new(storage.address_list_store()),
@@ -229,6 +234,7 @@ impl Stores {
             workflow_store: Arc::new(storage.workflow_store()),
             group_store: Arc::new(storage.group_store()),
             backend_registry,
+            revoked_token_store: Some(revoked_token_store),
             _storage: Some(storage),
         })
     }
@@ -522,7 +528,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100);
 
-            let auth_state = warden_api::AuthState::new(jwt_secret.as_bytes(), rate_limit);
+            let auth_state = match &stores.revoked_token_store {
+                Some(store) => {
+                    let state = warden_api::AuthState::with_persistent_blacklist(
+                        jwt_secret.as_bytes(),
+                        rate_limit,
+                        Arc::clone(store),
+                    );
+                    match state.load_blacklist().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(count, "Loaded revoked tokens from persistent store");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to load revoked tokens from store");
+                        }
+                    }
+                    state
+                }
+                None => warden_api::AuthState::new(jwt_secret.as_bytes(), rate_limit),
+            };
 
             let state = warden_api::AppState::new(
                 stores.policy_store,

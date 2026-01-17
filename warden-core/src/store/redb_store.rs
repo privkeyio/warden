@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{AddressEntry, AddressListStore, PolicyStore};
+use super::{AddressEntry, AddressListStore, PolicyStore, RevokedToken, RevokedTokenStore};
 use crate::approval::{
     Approval, ApprovalRequest, ApprovalStatus, ApprovalStore, ApprovalWorkflow, WorkflowStatus,
     WorkflowStore,
@@ -226,6 +226,7 @@ const ADDRESS_LISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 const WORKFLOWS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("workflows");
 const GROUPS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("groups");
 const APPROVALS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("approvals");
+const REVOKED_TOKENS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("revoked_tokens");
 
 pub struct RedbStorage {
     db: Arc<Database>,
@@ -289,6 +290,7 @@ impl RedbStorage {
             wtxn.open_table(WORKFLOWS_TABLE).storage_err()?;
             wtxn.open_table(GROUPS_TABLE).storage_err()?;
             wtxn.open_table(APPROVALS_TABLE).storage_err()?;
+            wtxn.open_table(REVOKED_TOKENS_TABLE).storage_err()?;
             wtxn.commit().storage_err()?;
         }
 
@@ -333,6 +335,13 @@ impl RedbStorage {
 
     pub fn approval_store(&self) -> RedbApprovalStore {
         RedbApprovalStore {
+            db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
+        }
+    }
+
+    pub fn revoked_token_store(&self) -> RedbRevokedTokenStore {
+        RedbRevokedTokenStore {
             db: Arc::clone(&self.db),
             cipher: self.cipher.clone(),
         }
@@ -1020,6 +1029,90 @@ impl ApprovalStore for RedbApprovalStore {
     }
 }
 
+pub struct RedbRevokedTokenStore {
+    db: Arc<Database>,
+    cipher: Option<Arc<DbCipher>>,
+}
+
+impl CipherOps for RedbRevokedTokenStore {
+    fn cipher(&self) -> Option<&DbCipher> {
+        self.cipher.as_deref()
+    }
+}
+
+#[async_trait]
+impl RevokedTokenStore for RedbRevokedTokenStore {
+    async fn revoke(&self, jti: &str, exp: u64) -> Result<()> {
+        let wtxn = self.db.begin_write().storage_err()?;
+        {
+            let mut table = wtxn.open_table(REVOKED_TOKENS_TABLE).storage_err()?;
+            let token = RevokedToken {
+                jti: jti.to_string(),
+                exp,
+            };
+            let value = self.serialize(&token)?;
+            table.insert(jti, value.as_slice()).storage_err()?;
+        }
+        wtxn.commit().storage_err()?;
+        Ok(())
+    }
+
+    async fn is_revoked(&self, jti: &str) -> Result<bool> {
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(REVOKED_TOKENS_TABLE).storage_err()?;
+        Ok(table.get(jti).storage_err()?.is_some())
+    }
+
+    async fn list_valid(&self) -> Result<Vec<RevokedToken>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let rtxn = self.db.begin_read().storage_err()?;
+        let table = rtxn.open_table(REVOKED_TOKENS_TABLE).storage_err()?;
+
+        let mut tokens = Vec::new();
+        for result in table.iter().storage_err()? {
+            let (_, value) = result.storage_err()?;
+            let token: RevokedToken = self.deserialize(value.value())?;
+            if token.exp > now {
+                tokens.push(token);
+            }
+        }
+        Ok(tokens)
+    }
+
+    async fn cleanup_expired(&self) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let wtxn = self.db.begin_write().storage_err()?;
+        let removed;
+        {
+            let mut table = wtxn.open_table(REVOKED_TOKENS_TABLE).storage_err()?;
+            let mut to_remove = Vec::new();
+
+            for result in table.iter().storage_err()? {
+                let (jti, value) = result.storage_err()?;
+                let token: RevokedToken = self.deserialize(value.value())?;
+                if token.exp <= now {
+                    to_remove.push(jti.value().to_string());
+                }
+            }
+
+            for jti in &to_remove {
+                table.remove(jti.as_str()).storage_err()?;
+            }
+            removed = to_remove.len();
+        }
+        wtxn.commit().storage_err()?;
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1233,5 +1326,89 @@ mod tests {
             0o600,
             "database file should have 0600 permissions"
         );
+    }
+
+    #[tokio::test]
+    async fn test_revoked_token_store() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&db_path).unwrap();
+        let store = storage.revoked_token_store();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert!(!store.is_revoked("jti-1").await.unwrap());
+
+        store.revoke("jti-1", now + 3600).await.unwrap();
+        assert!(store.is_revoked("jti-1").await.unwrap());
+
+        store.revoke("jti-2", now + 3600).await.unwrap();
+        store.revoke("jti-3", now - 100).await.unwrap();
+
+        let valid = store.list_valid().await.unwrap();
+        assert_eq!(valid.len(), 2);
+        assert!(valid.iter().any(|t| t.jti == "jti-1"));
+        assert!(valid.iter().any(|t| t.jti == "jti-2"));
+        assert!(!valid.iter().any(|t| t.jti == "jti-3"));
+
+        let removed = store.cleanup_expired().await.unwrap();
+        assert_eq!(removed, 1);
+
+        assert!(store.is_revoked("jti-1").await.unwrap());
+        assert!(store.is_revoked("jti-2").await.unwrap());
+        assert!(!store.is_revoked("jti-3").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_revoked_token_store_persistence() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("persist.db");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        {
+            let storage = RedbStorage::open(&db_path).unwrap();
+            let store = storage.revoked_token_store();
+            store.revoke("persistent-jti", now + 3600).await.unwrap();
+        }
+
+        {
+            let storage = RedbStorage::open(&db_path).unwrap();
+            let store = storage.revoked_token_store();
+            assert!(
+                store.is_revoked("persistent-jti").await.unwrap(),
+                "revoked token should persist across database reopens"
+            );
+            let valid = store.list_valid().await.unwrap();
+            assert_eq!(valid.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_revoked_token_store_encrypted() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("encrypted.db");
+        let key = [0x42u8; 32];
+        let cipher = DbCipher::new(&key);
+        let storage = RedbStorage::open_encrypted(&db_path, cipher).unwrap();
+        let store = storage.revoked_token_store();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        store.revoke("jti-123", now + 3600).await.unwrap();
+        assert!(store.is_revoked("jti-123").await.unwrap());
+
+        let valid = store.list_valid().await.unwrap();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].jti, "jti-123");
     }
 }

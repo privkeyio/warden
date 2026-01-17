@@ -118,9 +118,18 @@ impl JwtConfig {
     }
 }
 
-#[derive(Default)]
 pub struct TokenBlacklist {
     entries: RwLock<HashMap<String, u64>>,
+    store: Option<Arc<dyn warden_core::RevokedTokenStore>>,
+}
+
+impl Default for TokenBlacklist {
+    fn default() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            store: None,
+        }
+    }
 }
 
 impl TokenBlacklist {
@@ -128,8 +137,43 @@ impl TokenBlacklist {
         Self::default()
     }
 
+    pub fn with_store(store: Arc<dyn warden_core::RevokedTokenStore>) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            store: Some(store),
+        }
+    }
+
+    pub async fn load_from_store(&self) -> Result<usize, String> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+
+        let tokens = store
+            .list_valid()
+            .await
+            .map_err(|e| format!("failed to load revoked tokens: {}", e))?;
+
+        let mut entries = self.entries.write();
+        let count = tokens.len();
+        for token in tokens {
+            entries.insert(token.jti, token.exp);
+        }
+        Ok(count)
+    }
+
     pub fn revoke(&self, jti: String, exp: u64) {
-        self.entries.write().insert(jti, exp);
+        self.entries.write().insert(jti.clone(), exp);
+
+        if let Some(store) = &self.store {
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                if let Err(e) = store.revoke(&jti, exp).await {
+                    tracing::error!(jti = %jti, error = %e, "failed to persist token revocation");
+                }
+            });
+        }
     }
 
     pub fn is_revoked(&self, jti: &str) -> bool {
@@ -142,6 +186,15 @@ impl TokenBlacklist {
             .unwrap()
             .as_secs();
         self.entries.write().retain(|_, exp| *exp > now);
+
+        if let Some(store) = &self.store {
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                if let Err(e) = store.cleanup_expired().await {
+                    tracing::error!(error = %e, "failed to cleanup expired tokens from store");
+                }
+            });
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -394,30 +447,46 @@ pub struct AuthState {
 
 impl AuthState {
     pub fn new(jwt_secret: &[u8], requests_per_second: u32) -> Self {
-        let jwt_config = Arc::new(JwtConfig::new(jwt_secret));
-        let rps = NonZeroU32::new(requests_per_second.max(1)).expect("max(1) guarantees non-zero");
-        let quota = Quota::per_second(rps);
-        let rate_limiter = Arc::new(RateLimiter::direct(quota));
-        let jti_cache = Arc::new(JtiCache::new(10000));
-        Self {
-            jwt_config,
-            rate_limiter,
-            jti_cache,
-            token_blacklist: Arc::new(TokenBlacklist::new()),
-        }
+        Self::build(
+            Arc::new(JwtConfig::new(jwt_secret)),
+            requests_per_second,
+            TokenBlacklist::new(),
+        )
+    }
+
+    pub fn with_persistent_blacklist(
+        jwt_secret: &[u8],
+        requests_per_second: u32,
+        store: Arc<dyn warden_core::RevokedTokenStore>,
+    ) -> Self {
+        Self::build(
+            Arc::new(JwtConfig::new(jwt_secret)),
+            requests_per_second,
+            TokenBlacklist::with_store(store),
+        )
     }
 
     pub fn with_config(jwt_config: Arc<JwtConfig>, requests_per_second: u32) -> Self {
+        Self::build(jwt_config, requests_per_second, TokenBlacklist::new())
+    }
+
+    fn build(
+        jwt_config: Arc<JwtConfig>,
+        requests_per_second: u32,
+        blacklist: TokenBlacklist,
+    ) -> Self {
         let rps = NonZeroU32::new(requests_per_second.max(1)).expect("max(1) guarantees non-zero");
         let quota = Quota::per_second(rps);
-        let rate_limiter = Arc::new(RateLimiter::direct(quota));
-        let jti_cache = Arc::new(JtiCache::new(10000));
         Self {
             jwt_config,
-            rate_limiter,
-            jti_cache,
-            token_blacklist: Arc::new(TokenBlacklist::new()),
+            rate_limiter: Arc::new(RateLimiter::direct(quota)),
+            jti_cache: Arc::new(JtiCache::new(10000)),
+            token_blacklist: Arc::new(blacklist),
         }
+    }
+
+    pub async fn load_blacklist(&self) -> Result<usize, String> {
+        self.token_blacklist.load_from_store().await
     }
 
     pub fn check_rate_limit(&self) -> Result<(), AuthError> {
