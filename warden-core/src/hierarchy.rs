@@ -63,7 +63,14 @@ impl<K: Eq + Hash + Clone> TransitiveClosure<K> {
         let mut path_set = HashSet::new();
         let mut result = HashSet::new();
 
-        Self::dfs_visit(start, node_map, &mut visited, &mut path, &mut path_set, &mut result)?;
+        Self::dfs_visit(
+            start,
+            node_map,
+            &mut visited,
+            &mut path,
+            &mut path_set,
+            &mut result,
+        )?;
 
         result.remove(start);
         Ok(result)
@@ -379,7 +386,11 @@ impl EntityGraph {
                 .iter()
                 .map(|n| FilteredEntityNode {
                     id: n.id.clone(),
-                    edges: n.relations_of_type(&rel_type).into_iter().cloned().collect(),
+                    edges: n
+                        .relations_of_type(&rel_type)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
                 })
                 .collect();
 
@@ -544,7 +555,11 @@ impl<K: fmt::Debug> fmt::Display for HierarchyError<K> {
                 )
             }
             Self::InvalidRelation { from, to, reason } => {
-                write!(f, "invalid relation from {:?} to {:?}: {}", from, to, reason)
+                write!(
+                    f,
+                    "invalid relation from {:?} to {:?}: {}",
+                    from, to, reason
+                )
             }
         }
     }
