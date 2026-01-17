@@ -37,6 +37,18 @@ impl From<&Action> for SemanticAction {
     }
 }
 
+impl SemanticAction {
+    /// Returns true if this action grants a permission (Allow or RequireApproval).
+    /// Both Allow and RequireApproval are considered permission tiers that can
+    /// enable requests to proceed, unlike Deny which blocks them.
+    pub fn is_permission_tier(self) -> bool {
+        matches!(
+            self,
+            SemanticAction::Allow | SemanticAction::RequireApproval
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedCondition {
     True,
@@ -212,13 +224,14 @@ fn normalize_time(time: &TimeCondition) -> NormalizedCondition {
 
 impl SemanticPolicy {
     pub fn entails(&self, other: &SemanticPolicy) -> EntailmentResult {
+        // Check all rules that grant permissions (Allow or RequireApproval)
         for (i, rule) in self.rules.iter().enumerate() {
-            if rule.action == SemanticAction::Allow {
-                let covered = self.is_allow_covered_by(rule, other);
+            if rule.action.is_permission_tier() {
+                let covered = self.is_permission_tier_covered_by(rule, other);
                 if !covered {
                     return EntailmentResult::DoesNotEntail {
                         reason: format!(
-                            "rule '{}' (index {}) allows requests not covered by other policy",
+                            "rule '{}' (index {}) grants permissions not covered by other policy",
                             rule.id, i
                         ),
                     };
@@ -226,36 +239,41 @@ impl SemanticPolicy {
             }
         }
 
-        if self.default_action == SemanticAction::Allow
-            && !self.default_covered_by(other)
-        {
+        // Check if default action grants permissions
+        if self.default_action.is_permission_tier() && !self.default_covered_by(other) {
             return EntailmentResult::DoesNotEntail {
-                reason: "default ALLOW action permits requests not covered by other policy"
-                    .into(),
+                reason: "default action permits requests not covered by other policy".into(),
             };
         }
 
         EntailmentResult::Entails
     }
 
-    fn is_allow_covered_by(&self, rule: &SemanticRule, other: &SemanticPolicy) -> bool {
-        other.default_action == SemanticAction::Allow
+    /// Checks if a rule granting permissions is covered by the other policy.
+    /// A permission-granting rule (Allow or RequireApproval) is covered if the
+    /// other policy has a default permission tier or has a permission-granting
+    /// rule with a superset condition.
+    fn is_permission_tier_covered_by(&self, rule: &SemanticRule, other: &SemanticPolicy) -> bool {
+        other.default_action.is_permission_tier()
             || other.rules.iter().any(|other_rule| {
-                other_rule.action == SemanticAction::Allow
+                other_rule.action.is_permission_tier()
                     && rule.condition.is_subset_of(&other_rule.condition)
             })
     }
 
+    /// Checks if the default permission action is covered by the other policy.
     fn default_covered_by(&self, other: &SemanticPolicy) -> bool {
-        other.default_action == SemanticAction::Allow
+        other.default_action.is_permission_tier()
     }
 
+    /// Returns counterexamples showing requests that would be permitted by this
+    /// policy but not by the other policy. Includes both Allow and RequireApproval
+    /// actions as permission-granting.
     pub fn difference(&self, other: &SemanticPolicy) -> Vec<Counterexample> {
         let mut examples = Vec::new();
 
         for rule in &self.rules {
-            if rule.action == SemanticAction::Allow
-                && !self.is_allow_covered_by(rule, other)
+            if rule.action.is_permission_tier() && !self.is_permission_tier_covered_by(rule, other)
             {
                 if let Some(ce) = generate_counterexample(&rule.condition) {
                     examples.push(ce);
@@ -371,9 +389,10 @@ impl NormalizedCondition {
                 NormalizedCondition::AddressExact { addresses: a2 },
             ) => a1.is_subset(a2),
 
-            (NormalizedCondition::AddressIn { list: l1 }, NormalizedCondition::AddressIn { list: l2 }) => {
-                l1 == l2
-            }
+            (
+                NormalizedCondition::AddressIn { list: l1 },
+                NormalizedCondition::AddressIn { list: l2 },
+            ) => l1 == l2,
 
             (
                 NormalizedCondition::AddressNotIn { list: l1 },
@@ -403,21 +422,18 @@ impl NormalizedCondition {
                 days_ok && hours_ok
             }
 
-            (NormalizedCondition::And(parts), other) => {
-                parts.iter().any(|p| p.is_subset_of(other))
-            }
+            // And-vs-And: all conjuncts in self must be covered by some conjunct in other
+            (NormalizedCondition::And(a_parts), NormalizedCondition::And(b_parts)) => a_parts
+                .iter()
+                .all(|p| b_parts.iter().any(|q| p.is_subset_of(q))),
 
-            (cond, NormalizedCondition::And(parts)) => {
-                parts.iter().all(|p| cond.is_subset_of(p))
-            }
+            (NormalizedCondition::And(parts), other) => parts.iter().any(|p| p.is_subset_of(other)),
 
-            (NormalizedCondition::Or(parts), other) => {
-                parts.iter().all(|p| p.is_subset_of(other))
-            }
+            (cond, NormalizedCondition::And(parts)) => parts.iter().all(|p| cond.is_subset_of(p)),
 
-            (cond, NormalizedCondition::Or(parts)) => {
-                parts.iter().any(|p| cond.is_subset_of(p))
-            }
+            (NormalizedCondition::Or(parts), other) => parts.iter().all(|p| p.is_subset_of(other)),
+
+            (cond, NormalizedCondition::Or(parts)) => parts.iter().any(|p| cond.is_subset_of(p)),
 
             _ => false,
         }
@@ -465,9 +481,10 @@ impl NormalizedCondition {
                 NormalizedCondition::AddressExact { addresses: a2 },
             ) => !a1.is_disjoint(a2),
 
-            (NormalizedCondition::AddressIn { list: l1 }, NormalizedCondition::AddressIn { list: l2 }) => {
-                l1 == l2
-            }
+            (
+                NormalizedCondition::AddressIn { list: l1 },
+                NormalizedCondition::AddressIn { list: l2 },
+            ) => l1 == l2,
 
             (
                 NormalizedCondition::TimeWindow {
@@ -599,10 +616,9 @@ fn generate_counterexample(condition: &NormalizedCondition) -> Option<Counterexa
         }
         NormalizedCondition::SourceWallet { patterns } => {
             if let Some(p) = patterns.first() {
-                let wallet = p.strip_suffix('*').map_or_else(
-                    || p.clone(),
-                    |prefix| format!("{prefix}example"),
-                );
+                let wallet = p
+                    .strip_suffix('*')
+                    .map_or_else(|| p.clone(), |prefix| format!("{prefix}example"));
                 ce.description = format!("source wallet '{wallet}'");
                 ce.source_wallet = Some(wallet);
             }
