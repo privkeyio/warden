@@ -48,6 +48,18 @@ impl Default for CancellationToken {
     }
 }
 
+struct DoneGuard {
+    done: Arc<AtomicBool>,
+    done_notify: Arc<Notify>,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
+    }
+}
+
 pub struct TaskHandle<E = Error> {
     cancel_token: Arc<CancellationToken>,
     done: Arc<AtomicBool>,
@@ -73,6 +85,11 @@ impl<E: Send + 'static> TaskHandle<E> {
         let error_clone = Arc::clone(&error);
 
         let handle = tokio::spawn(async move {
+            let _guard = DoneGuard {
+                done: done_clone,
+                done_notify: done_notify_clone,
+            };
+
             tokio::select! {
                 biased;
                 _ = token_clone.cancelled() => {}
@@ -82,8 +99,6 @@ impl<E: Send + 'static> TaskHandle<E> {
                     }
                 }
             }
-            done_clone.store(true, Ordering::SeqCst);
-            done_notify_clone.notify_waiters();
         });
 
         Self {
@@ -198,9 +213,10 @@ impl<E: Send + Clone + 'static> TaskGroup<E> {
             if pending.is_empty() {
                 return;
             }
-            for (done, notify) in pending {
+            for (done, done_notify) in pending {
+                let notified = done_notify.notified();
                 if !done.load(Ordering::SeqCst) {
-                    notify.notified().await;
+                    notified.await;
                 }
             }
         }

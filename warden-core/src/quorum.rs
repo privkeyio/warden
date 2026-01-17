@@ -60,6 +60,7 @@ impl RequirementNode {
                 if requirements.is_empty() {
                     return Err(QuorumValidationError::EmptyRequirements);
                 }
+                Self::check_duplicate_sibling_groups(requirements)?;
                 for req in requirements {
                     req.validate()?;
                 }
@@ -77,8 +78,25 @@ impl RequirementNode {
                         count: requirements.len() as u32,
                     });
                 }
+                Self::check_duplicate_sibling_groups(requirements)?;
                 for req in requirements {
                     req.validate()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_duplicate_sibling_groups(
+        requirements: &[RequirementNode],
+    ) -> Result<(), QuorumValidationError> {
+        let mut seen_groups = HashSet::new();
+        for req in requirements {
+            if let RequirementNode::Threshold { group, .. } = req {
+                if !seen_groups.insert(group.clone()) {
+                    return Err(QuorumValidationError::DuplicateSiblingGroupId {
+                        group_id: group.clone(),
+                    });
                 }
             }
         }
@@ -133,6 +151,7 @@ pub enum QuorumValidationError {
     EmptyGroup,
     EmptyRequirements,
     ThresholdExceedsRequirements { k: u32, count: u32 },
+    DuplicateSiblingGroupId { group_id: GroupId },
 }
 
 impl std::fmt::Display for QuorumValidationError {
@@ -143,6 +162,9 @@ impl std::fmt::Display for QuorumValidationError {
             Self::EmptyRequirements => write!(f, "requirements list cannot be empty"),
             Self::ThresholdExceedsRequirements { k, count } => {
                 write!(f, "k ({}) exceeds requirement count ({})", k, count)
+            }
+            Self::DuplicateSiblingGroupId { group_id } => {
+                write!(f, "duplicate GroupId in sibling requirements: {}", group_id)
             }
         }
     }
@@ -516,6 +538,62 @@ mod tests {
                 .is_err()
         );
         assert!(RequirementNode::threshold(2, "treasury").validate().is_ok());
+    }
+
+    #[test]
+    fn test_duplicate_sibling_group_validation() {
+        // Duplicate GroupId in All should fail
+        let duplicate_all = RequirementNode::all(vec![
+            RequirementNode::threshold(2, "treasury"),
+            RequirementNode::threshold(3, "treasury"),
+        ]);
+        let result = duplicate_all.validate();
+        assert!(matches!(
+            result,
+            Err(QuorumValidationError::DuplicateSiblingGroupId { group_id }) if group_id == "treasury"
+        ));
+
+        // Duplicate GroupId in Any should fail
+        let duplicate_any = RequirementNode::any(vec![
+            RequirementNode::threshold(1, "security"),
+            RequirementNode::threshold(2, "security"),
+        ]);
+        assert!(matches!(
+            duplicate_any.validate(),
+            Err(QuorumValidationError::DuplicateSiblingGroupId { .. })
+        ));
+
+        // Duplicate GroupId in KOf should fail
+        let duplicate_kof = RequirementNode::k_of(
+            2,
+            vec![
+                RequirementNode::threshold(1, "compliance"),
+                RequirementNode::threshold(1, "compliance"),
+                RequirementNode::threshold(1, "finance"),
+            ],
+        );
+        assert!(matches!(
+            duplicate_kof.validate(),
+            Err(QuorumValidationError::DuplicateSiblingGroupId { .. })
+        ));
+
+        // Same GroupId at different nesting levels should be allowed
+        let nested_same_group = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "treasury"),
+            RequirementNode::any(vec![
+                RequirementNode::threshold(2, "treasury"), // Different level, OK
+                RequirementNode::threshold(1, "finance"),
+            ]),
+        ]);
+        assert!(nested_same_group.validate().is_ok());
+
+        // Different groups at same level should be allowed
+        let different_groups = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "treasury"),
+            RequirementNode::threshold(2, "finance"),
+            RequirementNode::threshold(1, "compliance"),
+        ]);
+        assert!(different_groups.validate().is_ok());
     }
 
     #[test]
