@@ -13,6 +13,7 @@ pub mod escalation;
 pub mod evaluator;
 pub mod group;
 pub mod lifecycle;
+pub mod metrics;
 pub mod notification;
 pub mod pattern;
 pub mod permit;
@@ -127,3 +128,5 @@ pub use secrets::{
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
 pub use task::{CancellationToken, TaskHandle};
+
+pub use metrics::{LabeledMetrics, MetricsRecorder, PolicyMetrics};
