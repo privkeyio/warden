@@ -82,7 +82,12 @@ impl PolicyMetrics {
     }
 
     pub fn workflow_completed(&self) {
-        let prev = self.workflow_pending.fetch_sub(1, Ordering::Relaxed);
+        let prev = self
+            .workflow_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some((current - 1).max(0))
+            })
+            .unwrap(); // Safe: closure always returns Some
         gauge!(METRIC_WORKFLOW_PENDING).set((prev - 1).max(0) as f64);
     }
 
@@ -92,7 +97,12 @@ impl PolicyMetrics {
     }
 
     pub fn session_completed(&self) {
-        let prev = self.sessions_active.fetch_sub(1, Ordering::Relaxed);
+        let prev = self
+            .sessions_active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some((current - 1).max(0))
+            })
+            .unwrap(); // Safe: closure always returns Some
         gauge!(METRIC_SESSIONS_ACTIVE).set((prev - 1).max(0) as f64);
     }
 
