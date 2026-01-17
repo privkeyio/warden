@@ -12,6 +12,7 @@ pub mod error;
 pub mod escalation;
 pub mod evaluator;
 pub mod group;
+pub mod heartbeat;
 pub mod lifecycle;
 pub mod metrics;
 pub mod notification;
@@ -78,6 +79,10 @@ pub use velocity::{
 };
 pub use workflow::{
     CompletionCallback, LoggingCallback, TimeoutChecker, WorkflowCompletionHandler,
+};
+
+pub use heartbeat::{
+    HeartbeatChecker, HeartbeatConfig, HeartbeatDetails, HeartbeatTracker, WorkflowHeartbeat,
 };
 
 pub use audit::{
