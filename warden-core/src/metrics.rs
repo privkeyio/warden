@@ -77,25 +77,23 @@ impl PolicyMetrics {
     }
 
     pub fn workflow_started(&self) {
-        self.workflow_pending.fetch_add(1, Ordering::Relaxed);
-        gauge!(METRIC_WORKFLOW_PENDING).set(self.workflow_pending.load(Ordering::Relaxed) as f64);
+        let prev = self.workflow_pending.fetch_add(1, Ordering::Relaxed);
+        gauge!(METRIC_WORKFLOW_PENDING).set((prev + 1) as f64);
     }
 
     pub fn workflow_completed(&self) {
-        self.workflow_pending.fetch_sub(1, Ordering::Relaxed);
-        gauge!(METRIC_WORKFLOW_PENDING)
-            .set(self.workflow_pending.load(Ordering::Relaxed).max(0) as f64);
+        let prev = self.workflow_pending.fetch_sub(1, Ordering::Relaxed);
+        gauge!(METRIC_WORKFLOW_PENDING).set((prev - 1).max(0) as f64);
     }
 
     pub fn session_started(&self) {
-        self.sessions_active.fetch_add(1, Ordering::Relaxed);
-        gauge!(METRIC_SESSIONS_ACTIVE).set(self.sessions_active.load(Ordering::Relaxed) as f64);
+        let prev = self.sessions_active.fetch_add(1, Ordering::Relaxed);
+        gauge!(METRIC_SESSIONS_ACTIVE).set((prev + 1) as f64);
     }
 
     pub fn session_completed(&self) {
-        self.sessions_active.fetch_sub(1, Ordering::Relaxed);
-        gauge!(METRIC_SESSIONS_ACTIVE)
-            .set(self.sessions_active.load(Ordering::Relaxed).max(0) as f64);
+        let prev = self.sessions_active.fetch_sub(1, Ordering::Relaxed);
+        gauge!(METRIC_SESSIONS_ACTIVE).set((prev - 1).max(0) as f64);
     }
 
     pub fn pending_workflows(&self) -> i64 {
