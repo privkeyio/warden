@@ -8,6 +8,7 @@ pub mod callback;
 pub mod compliance;
 pub mod config;
 pub mod enclave;
+pub mod entailment;
 pub mod error;
 pub mod escalation;
 pub mod evaluator;
@@ -124,3 +125,9 @@ pub use secrets::{
     VaultSecretsProvider,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
+
+pub use entailment::{
+    validate_policy_upgrade, Counterexample, EntailmentResult, NormalizedCondition,
+    NormalizedHourRange, PolicyConflict, PolicyUpgradeValidation, RedundantRule, SemanticAction,
+    SemanticPolicy, SemanticRule,
+};
