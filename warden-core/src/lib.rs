@@ -144,7 +144,7 @@ pub use hierarchy::{
 };
 
 pub use entailment::{
-    Counterexample, EntailmentResult, NormalizedCondition, NormalizedHourRange, PolicyConflict,
-    PolicyUpgradeValidation, RedundantRule, SemanticAction, SemanticPolicy, SemanticRule,
-    validate_policy_upgrade,
+    validate_policy_upgrade, Counterexample, EntailmentResult, NormalizedCondition,
+    NormalizedHourRange, PolicyConflict, PolicyUpgradeValidation, RedundantRule, SemanticAction,
+    SemanticPolicy, SemanticRule,
 };
