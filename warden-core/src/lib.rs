@@ -12,6 +12,7 @@ pub mod error;
 pub mod escalation;
 pub mod evaluator;
 pub mod group;
+pub mod heartbeat;
 pub mod lifecycle;
 pub mod notification;
 pub mod pattern;
@@ -23,6 +24,7 @@ pub mod risk;
 pub mod secrets;
 pub mod ssrf;
 pub mod store;
+pub mod task_handle;
 pub mod velocity;
 pub mod workflow;
 
@@ -76,6 +78,11 @@ pub use velocity::{
 pub use workflow::{
     CompletionCallback, LoggingCallback, TimeoutChecker, WorkflowCompletionHandler,
 };
+
+pub use heartbeat::{
+    HeartbeatChecker, HeartbeatConfig, HeartbeatDetails, HeartbeatTracker, WorkflowHeartbeat,
+};
+pub use task_handle::{CancellationToken, TaskGroup, TaskHandle};
 
 pub use audit::{
     ActorInfo, ActorType, AuditEvent, AuditEventType, AuditLog, AuditQuery, AuditSigner,

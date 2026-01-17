@@ -91,6 +91,23 @@ impl RequirementNode {
         groups
     }
 
+    pub fn minimum_approvals(&self) -> u32 {
+        match self {
+            RequirementNode::Threshold { threshold, .. } => *threshold,
+            RequirementNode::All { requirements } => {
+                requirements.iter().map(|r| r.minimum_approvals()).sum()
+            }
+            RequirementNode::Any { requirements } => {
+                requirements.iter().map(|r| r.minimum_approvals()).min().unwrap_or(0)
+            }
+            RequirementNode::KOf { k, requirements } => {
+                let mut mins: Vec<u32> = requirements.iter().map(|r| r.minimum_approvals()).collect();
+                mins.sort_unstable();
+                mins.iter().take(*k as usize).sum()
+            }
+        }
+    }
+
     fn collect_groups(&self, groups: &mut HashSet<GroupId>) {
         match self {
             RequirementNode::Threshold { group, .. } => {
