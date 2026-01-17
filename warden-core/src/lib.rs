@@ -12,6 +12,7 @@ pub mod error;
 pub mod escalation;
 pub mod evaluator;
 pub mod group;
+pub mod hierarchy;
 pub mod lifecycle;
 pub mod notification;
 pub mod pattern;
@@ -124,3 +125,8 @@ pub use secrets::{
     VaultSecretsProvider,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
+
+pub use hierarchy::{
+    CycleError, EntityGraph, EntityId, EntityNode, HierarchyError, HierarchyValidator,
+    RelationType, Role, RoleHierarchy, RoleId, TCNode, TransitiveClosure,
+};
