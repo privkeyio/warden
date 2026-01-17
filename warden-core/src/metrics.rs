@@ -83,7 +83,8 @@ impl PolicyMetrics {
 
     pub fn workflow_completed(&self) {
         self.workflow_pending.fetch_sub(1, Ordering::Relaxed);
-        gauge!(METRIC_WORKFLOW_PENDING).set(self.workflow_pending.load(Ordering::Relaxed).max(0) as f64);
+        gauge!(METRIC_WORKFLOW_PENDING)
+            .set(self.workflow_pending.load(Ordering::Relaxed).max(0) as f64);
     }
 
     pub fn session_started(&self) {
@@ -93,7 +94,8 @@ impl PolicyMetrics {
 
     pub fn session_completed(&self) {
         self.sessions_active.fetch_sub(1, Ordering::Relaxed);
-        gauge!(METRIC_SESSIONS_ACTIVE).set(self.sessions_active.load(Ordering::Relaxed).max(0) as f64);
+        gauge!(METRIC_SESSIONS_ACTIVE)
+            .set(self.sessions_active.load(Ordering::Relaxed).max(0) as f64);
     }
 
     pub fn pending_workflows(&self) -> i64 {
@@ -116,8 +118,8 @@ impl MetricsRecorder {
             .install()
     }
 
-    pub fn install_prometheus_with_defaults(
-    ) -> Result<(), metrics_exporter_prometheus::BuildError> {
+    pub fn install_prometheus_with_defaults() -> Result<(), metrics_exporter_prometheus::BuildError>
+    {
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], 9090).into();
         Self::install_prometheus(addr)
     }
