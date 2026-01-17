@@ -268,9 +268,7 @@ mod tests {
 
     #[test]
     fn test_bypass_flags_builder() {
-        let flags = BypassFlags::none()
-            .with_skip_rate_limit()
-            .with_skip_audit();
+        let flags = BypassFlags::none().with_skip_rate_limit().with_skip_audit();
         assert!(flags.skip_rate_limit);
         assert!(flags.skip_audit);
         assert!(!flags.skip_compliance);
@@ -279,8 +277,7 @@ mod tests {
 
     #[test]
     fn test_retry_override() {
-        let policy = TieredRetryPolicy::default()
-            .with_standard(RetryPolicy::aggressive());
+        let policy = TieredRetryPolicy::default().with_standard(RetryPolicy::aggressive());
         let override_ = RetryOverride::new(policy);
         assert_eq!(override_.policy.standard.maximum_attempts, 5);
     }
