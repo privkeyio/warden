@@ -15,12 +15,23 @@ pub enum ContextRole {
     Service,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RequestContext {
     pub user_id: String,
     pub role: ContextRole,
     pub audit_id: Uuid,
     pub trace_id: String,
+}
+
+impl std::fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestContext")
+            .field("user_id", &"<redacted>")
+            .field("role", &self.role)
+            .field("audit_id", &self.audit_id)
+            .field("trace_id", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RequestContext {
