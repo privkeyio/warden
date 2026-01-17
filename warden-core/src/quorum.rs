@@ -97,11 +97,14 @@ impl RequirementNode {
             RequirementNode::All { requirements } => {
                 requirements.iter().map(|r| r.minimum_approvals()).sum()
             }
-            RequirementNode::Any { requirements } => {
-                requirements.iter().map(|r| r.minimum_approvals()).min().unwrap_or(0)
-            }
+            RequirementNode::Any { requirements } => requirements
+                .iter()
+                .map(|r| r.minimum_approvals())
+                .min()
+                .unwrap_or(0),
             RequirementNode::KOf { k, requirements } => {
-                let mut mins: Vec<u32> = requirements.iter().map(|r| r.minimum_approvals()).collect();
+                let mut mins: Vec<u32> =
+                    requirements.iter().map(|r| r.minimum_approvals()).collect();
                 mins.sort_unstable();
                 mins.iter().take(*k as usize).sum()
             }

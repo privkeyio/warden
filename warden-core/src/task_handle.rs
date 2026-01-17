@@ -257,9 +257,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_handle_captures_error() {
-        let handle: TaskHandle<TestError> = TaskHandle::spawn(|_token| async {
-            Err(TestError("task failed".into()))
-        });
+        let handle: TaskHandle<TestError> =
+            TaskHandle::spawn(|_token| async { Err(TestError("task failed".into())) });
 
         handle.done().await;
         assert!(handle.is_done());
@@ -387,9 +386,8 @@ mod tests {
         let result = handle.join().await;
         assert!(result.is_ok());
 
-        let handle: TaskHandle<TestError> = TaskHandle::spawn(|_| async {
-            Err(TestError("join error".into()))
-        });
+        let handle: TaskHandle<TestError> =
+            TaskHandle::spawn(|_| async { Err(TestError("join error".into())) });
         let result = handle.join().await;
         assert!(result.is_err());
     }

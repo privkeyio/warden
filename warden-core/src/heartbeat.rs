@@ -29,7 +29,6 @@ impl Default for HeartbeatConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatDetails {
     pub progress_percent: u8,
@@ -234,7 +233,10 @@ impl HeartbeatChecker {
         Ok(timed_out)
     }
 
-    pub fn spawn(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -367,7 +369,11 @@ mod tests {
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0], workflow_id);
 
-        let workflow = workflow_store.get_workflow(&workflow_id).await.unwrap().unwrap();
+        let workflow = workflow_store
+            .get_workflow(&workflow_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(workflow.status, WorkflowStatus::TimedOut);
         assert_eq!(workflow.rejection_reason, Some("Heartbeat timeout".into()));
     }
