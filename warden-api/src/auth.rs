@@ -221,6 +221,7 @@ impl TokenBlacklist {
         Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
 
             loop {
                 ticker.tick().await;
