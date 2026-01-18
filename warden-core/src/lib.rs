@@ -67,7 +67,8 @@ pub use retry::{ClassifyError, ErrorKind, RetryDecision, TieredRetryPolicy};
 pub use risk::{RiskConfig, RiskEngine, RiskFactors, RiskLevel, RiskScore};
 pub use store::{
     AddressEntry, AddressListStore, DbCipher, InMemoryAddressListStore, InMemoryPolicyStore,
-    PolicyStore, RedbAddressListStore, RedbApprovalStore, RedbPolicyStore, RedbStorage,
+    PolicyStore, RedbAddressListStore, RedbApprovalStore, RedbPolicyStore, RedbRevokedTokenStore,
+    RedbStorage, RevokedToken, RevokedTokenStore,
 };
 pub use velocity::{
     InMemoryVelocityStore, VelocityCheck, VelocityLimits, VelocityStore, VelocityTracker,
