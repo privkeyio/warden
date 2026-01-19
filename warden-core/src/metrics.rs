@@ -9,29 +9,28 @@ use tracing::debug;
 
 use crate::evaluator::{EvaluationResult, PolicyDecisionSerde};
 
-/// Buckets a rule_id into a bounded set of categories to prevent Prometheus cardinality explosion.
-/// Returns a static string label suitable for metrics.
+fn saturating_decrement(counter: &AtomicI64) -> i64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some((v - 1).max(0))
+        })
+        .map(|prev| (prev - 1).max(0))
+        .unwrap_or(0)
+}
+
 fn bucket_rule_id(rule_id: &str) -> &'static str {
-    // Check for common builtin rule prefixes
     if rule_id.starts_with("builtin:") || rule_id.starts_with("system:") {
         return "builtin";
     }
-
-    // Check for default/fallback rules
     if rule_id == "default" || rule_id.starts_with("default:") || rule_id == "fallback" {
         return "default";
     }
-
-    // Everything else is a custom rule
     "custom"
 }
 
-/// Maps a denial reason to a bounded set of categories to prevent Prometheus cardinality explosion.
-/// Returns a static string label suitable for metrics. Full reason text should only be used in logs/traces.
 fn map_denial_reason_to_label(reason: &str) -> &'static str {
     let reason_lower = reason.to_lowercase();
 
-    // Default deny (no matching allow rule)
     if reason_lower.contains("default deny")
         || reason_lower.contains("no matching")
         || reason_lower.contains("no rule")
@@ -40,7 +39,6 @@ fn map_denial_reason_to_label(reason: &str) -> &'static str {
         return "default_deny";
     }
 
-    // Explicit rule denial
     if reason_lower.contains("denied by rule")
         || reason_lower.contains("rule denied")
         || reason_lower.contains("policy denied")
@@ -49,7 +47,6 @@ fn map_denial_reason_to_label(reason: &str) -> &'static str {
         return "rule_denied";
     }
 
-    // Amount/limit exceeded
     if reason_lower.contains("exceed")
         || reason_lower.contains("limit")
         || reason_lower.contains("threshold")
@@ -58,12 +55,10 @@ fn map_denial_reason_to_label(reason: &str) -> &'static str {
         return "limit_exceeded";
     }
 
-    // Rate limiting
     if reason_lower.contains("rate") || reason_lower.contains("throttl") {
         return "rate_limited";
     }
 
-    // Unauthorized/forbidden
     if reason_lower.contains("unauthorized")
         || reason_lower.contains("forbidden")
         || reason_lower.contains("permission")
@@ -71,12 +66,10 @@ fn map_denial_reason_to_label(reason: &str) -> &'static str {
         return "unauthorized";
     }
 
-    // Expired/timeout
     if reason_lower.contains("expir") || reason_lower.contains("timeout") {
         return "expired";
     }
 
-    // Catch-all for unrecognized reasons
     "other"
 }
 
@@ -118,14 +111,8 @@ impl PolicyMetrics {
             }
         };
 
-        // Use bucketed rule_id to prevent cardinality explosion
         let rule_bucket = bucket_rule_id(rule_id);
-
-        counter!(METRIC_DECISIONS,
-            "outcome" => outcome,
-            "rule_bucket" => rule_bucket
-        )
-        .increment(1);
+        counter!(METRIC_DECISIONS, "outcome" => outcome, "rule_bucket" => rule_bucket).increment(1);
 
         let latency_secs = result.evaluation_time_us as f64 / 1_000_000.0;
         histogram!(METRIC_EVALUATION).record(latency_secs);
@@ -140,14 +127,11 @@ impl PolicyMetrics {
     }
 
     pub fn record_rule_evaluated(&self, rule_id: &str) {
-        // Use bucketed rule_id to prevent cardinality explosion
         let rule_bucket = bucket_rule_id(rule_id);
         counter!(METRIC_RULES_EVALUATED, "rule_bucket" => rule_bucket).increment(1);
     }
 
     pub fn record_denial(&self, reason: &str, rule_id: &str) {
-        // Use bucketed labels to prevent cardinality explosion
-        // Full reason and rule_id are logged for debugging but not used as metric labels
         let reason_label = map_denial_reason_to_label(reason);
         let rule_bucket = bucket_rule_id(rule_id);
 
@@ -159,41 +143,28 @@ impl PolicyMetrics {
             "Policy denial recorded"
         );
 
-        counter!(METRIC_DENIALS,
-            "reason_category" => reason_label,
-            "rule_bucket" => rule_bucket
-        )
-        .increment(1);
+        counter!(METRIC_DENIALS, "reason_category" => reason_label, "rule_bucket" => rule_bucket)
+            .increment(1);
     }
 
     pub fn workflow_started(&self) {
-        let prev = self.workflow_pending.fetch_add(1, Ordering::Relaxed);
-        gauge!(METRIC_WORKFLOW_PENDING).set((prev + 1) as f64);
+        let new_val = self.workflow_pending.fetch_add(1, Ordering::Relaxed) + 1;
+        gauge!(METRIC_WORKFLOW_PENDING).set(new_val as f64);
     }
 
     pub fn workflow_completed(&self) {
-        let prev = self
-            .workflow_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some((current - 1).max(0))
-            })
-            .unwrap(); // Safe: closure always returns Some
-        gauge!(METRIC_WORKFLOW_PENDING).set((prev - 1).max(0) as f64);
+        let new_val = saturating_decrement(&self.workflow_pending);
+        gauge!(METRIC_WORKFLOW_PENDING).set(new_val as f64);
     }
 
     pub fn session_started(&self) {
-        let prev = self.sessions_active.fetch_add(1, Ordering::Relaxed);
-        gauge!(METRIC_SESSIONS_ACTIVE).set((prev + 1) as f64);
+        let new_val = self.sessions_active.fetch_add(1, Ordering::Relaxed) + 1;
+        gauge!(METRIC_SESSIONS_ACTIVE).set(new_val as f64);
     }
 
     pub fn session_completed(&self) {
-        let prev = self
-            .sessions_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some((current - 1).max(0))
-            })
-            .unwrap(); // Safe: closure always returns Some
-        gauge!(METRIC_SESSIONS_ACTIVE).set((prev - 1).max(0) as f64);
+        let new_val = saturating_decrement(&self.sessions_active);
+        gauge!(METRIC_SESSIONS_ACTIVE).set(new_val as f64);
     }
 
     pub fn pending_workflows(&self) -> i64 {
