@@ -277,32 +277,31 @@ impl HeartbeatChecker {
 
         for workflow_id in stale {
             if let Some(mut workflow) = self.workflow_store.get_workflow(&workflow_id).await? {
-                let original_status = workflow.status;
-                if workflow.status == WorkflowStatus::Pending {
+                if workflow.status != WorkflowStatus::Pending {
+                    info!(
+                        workflow_id = %workflow_id,
+                        status = ?workflow.status,
+                        "Skipping stale workflow already transitioned"
+                    );
+                } else {
                     workflow.status = WorkflowStatus::TimedOut;
                     workflow.rejection_reason = Some("Heartbeat timeout".into());
                     workflow.completed_at = Some(Utc::now());
                     self.workflow_store.update_workflow(workflow).await?;
 
                     if let Some(updated) = self.workflow_store.get_workflow(&workflow_id).await? {
-                        if updated.status != WorkflowStatus::TimedOut {
+                        if updated.status == WorkflowStatus::TimedOut {
+                            timed_out.push(workflow_id);
+                            info!(workflow_id = %workflow_id, "Workflow timed out due to missed heartbeat");
+                        } else {
                             warn!(
                                 workflow_id = %workflow_id,
                                 expected = "TimedOut",
                                 actual = ?updated.status,
                                 "Workflow status changed after update (possible race)"
                             );
-                        } else {
-                            timed_out.push(workflow_id);
-                            info!(workflow_id = %workflow_id, "Workflow timed out due to missed heartbeat");
                         }
                     }
-                } else if original_status != WorkflowStatus::Pending {
-                    info!(
-                        workflow_id = %workflow_id,
-                        status = ?original_status,
-                        "Skipping stale workflow already transitioned"
-                    );
                 }
             }
             self.tracker.unregister(workflow_id);

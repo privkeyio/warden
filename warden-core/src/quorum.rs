@@ -69,32 +69,38 @@ impl RequirementNode {
                 }
             }
             RequirementNode::All { requirements } | RequirementNode::Any { requirements } => {
-                if requirements.is_empty() {
-                    return Err(QuorumValidationError::EmptyRequirements);
-                }
-                Self::check_duplicate_sibling_groups(requirements)?;
-                for req in requirements {
-                    req.validate_with_depth(depth + 1)?;
-                }
+                self.validate_children(requirements, depth, None)?;
             }
             RequirementNode::KOf { k, requirements } => {
                 if *k == 0 {
                     return Err(QuorumValidationError::ZeroThreshold);
                 }
-                if requirements.is_empty() {
-                    return Err(QuorumValidationError::EmptyRequirements);
-                }
-                if *k > requirements.len() as u32 {
-                    return Err(QuorumValidationError::ThresholdExceedsRequirements {
-                        k: *k,
-                        count: requirements.len() as u32,
-                    });
-                }
-                Self::check_duplicate_sibling_groups(requirements)?;
-                for req in requirements {
-                    req.validate_with_depth(depth + 1)?;
-                }
+                self.validate_children(requirements, depth, Some(*k))?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_children(
+        &self,
+        requirements: &[RequirementNode],
+        depth: usize,
+        k: Option<u32>,
+    ) -> Result<(), QuorumValidationError> {
+        if requirements.is_empty() {
+            return Err(QuorumValidationError::EmptyRequirements);
+        }
+        if let Some(k) = k {
+            if k > requirements.len() as u32 {
+                return Err(QuorumValidationError::ThresholdExceedsRequirements {
+                    k,
+                    count: requirements.len() as u32,
+                });
+            }
+        }
+        Self::check_duplicate_sibling_groups(requirements)?;
+        for req in requirements {
+            req.validate_with_depth(depth + 1)?;
         }
         Ok(())
     }
