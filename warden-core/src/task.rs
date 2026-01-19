@@ -10,6 +10,17 @@ use std::sync::Arc;
 
 use crate::Error;
 
+async fn wait_for_signal(flag: &AtomicBool, notify: &Notify) {
+    loop {
+        let mut notified = std::pin::pin!(notify.notified());
+        notified.as_mut().enable();
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 #[derive(Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -34,14 +45,7 @@ impl CancellationToken {
     }
 
     pub async fn cancelled(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.notify.notified());
-            notified.as_mut().enable();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
+        wait_for_signal(&self.cancelled, &self.notify).await;
     }
 }
 
@@ -52,8 +56,7 @@ impl Default for CancellationToken {
 }
 
 pub struct TaskHandle {
-    cancelled: Arc<AtomicBool>,
-    cancel_notify: Arc<Notify>,
+    token: CancellationToken,
     done: Arc<AtomicBool>,
     done_notify: Arc<Notify>,
     error: Arc<Mutex<Option<Error>>>,
@@ -66,33 +69,26 @@ impl TaskHandle {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), Error>> + Send,
     {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancel_notify = Arc::new(Notify::new());
+        let token = CancellationToken::new();
         let done = Arc::new(AtomicBool::new(false));
         let done_notify = Arc::new(Notify::new());
         let error = Arc::new(Mutex::new(None));
 
-        let token = CancellationToken {
-            cancelled: Arc::clone(&cancelled),
-            notify: Arc::clone(&cancel_notify),
-        };
-
-        let done_clone = Arc::clone(&done);
-        let done_notify_clone = Arc::clone(&done_notify);
-        let error_clone = Arc::clone(&error);
+        let task_token = token.clone();
+        let task_done = Arc::clone(&done);
+        let task_done_notify = Arc::clone(&done_notify);
+        let task_error = Arc::clone(&error);
 
         let handle = tokio::spawn(async move {
-            let result = f(token).await;
-            if let Err(e) = result {
-                *error_clone.lock() = Some(e);
+            if let Err(e) = f(task_token).await {
+                *task_error.lock() = Some(e);
             }
-            done_clone.store(true, Ordering::Release);
-            done_notify_clone.notify_waiters();
+            task_done.store(true, Ordering::Release);
+            task_done_notify.notify_waiters();
         });
 
         Self {
-            cancelled,
-            cancel_notify,
+            token,
             done,
             done_notify,
             error,
@@ -101,12 +97,11 @@ impl TaskHandle {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.cancel_notify.notify_waiters();
+        self.token.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.token.is_cancelled()
     }
 
     pub fn is_done(&self) -> bool {
@@ -114,14 +109,7 @@ impl TaskHandle {
     }
 
     pub async fn done(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.done_notify.notified());
-            notified.as_mut().enable();
-            if self.is_done() {
-                return;
-            }
-            notified.await;
-        }
+        wait_for_signal(&self.done, &self.done_notify).await;
     }
 
     pub async fn done_timeout(&self, timeout: std::time::Duration) -> Result<(), ()> {
