@@ -256,7 +256,7 @@ mod tests {
         for _ in 0..100 {
             let delay = policy.next_backoff(0).unwrap();
             let secs = delay.as_secs_f64();
-            assert!(secs >= 8.0 && secs <= 10.0, "delay was {}", secs);
+            assert!((8.0..=10.0).contains(&secs), "delay was {}", secs);
         }
     }
 

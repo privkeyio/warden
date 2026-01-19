@@ -23,6 +23,7 @@ pub mod risk;
 pub mod secrets;
 pub mod ssrf;
 pub mod store;
+pub mod task;
 pub mod velocity;
 pub mod workflow;
 
@@ -125,3 +126,4 @@ pub use secrets::{
     VaultSecretsProvider,
 };
 pub use ssrf::{SsrfError, SsrfPolicy};
+pub use task::{CancellationToken, TaskHandle};
