@@ -7,6 +7,8 @@ use crate::approval::{Approval, ApprovalDecision};
 
 pub type GroupId = String;
 
+const MAX_NESTING_DEPTH: usize = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequirementNode {
@@ -47,6 +49,16 @@ impl RequirementNode {
     }
 
     pub fn validate(&self) -> Result<(), QuorumValidationError> {
+        self.validate_with_depth(0)
+    }
+
+    fn validate_with_depth(&self, depth: usize) -> Result<(), QuorumValidationError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(QuorumValidationError::MaxNestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+
         match self {
             RequirementNode::Threshold { threshold, group } => {
                 if *threshold == 0 {
@@ -62,7 +74,7 @@ impl RequirementNode {
                 }
                 Self::check_duplicate_sibling_groups(requirements)?;
                 for req in requirements {
-                    req.validate()?;
+                    req.validate_with_depth(depth + 1)?;
                 }
             }
             RequirementNode::KOf { k, requirements } => {
@@ -80,7 +92,7 @@ impl RequirementNode {
                 }
                 Self::check_duplicate_sibling_groups(requirements)?;
                 for req in requirements {
-                    req.validate()?;
+                    req.validate_with_depth(depth + 1)?;
                 }
             }
         }
@@ -152,6 +164,7 @@ pub enum QuorumValidationError {
     EmptyRequirements,
     ThresholdExceedsRequirements { k: u32, count: u32 },
     DuplicateSiblingGroupId { group_id: GroupId },
+    MaxNestingDepthExceeded { max: usize },
 }
 
 impl std::fmt::Display for QuorumValidationError {
@@ -165,6 +178,9 @@ impl std::fmt::Display for QuorumValidationError {
             }
             Self::DuplicateSiblingGroupId { group_id } => {
                 write!(f, "duplicate GroupId in sibling requirements: {}", group_id)
+            }
+            Self::MaxNestingDepthExceeded { max } => {
+                write!(f, "nesting depth exceeds maximum of {}", max)
             }
         }
     }
@@ -653,5 +669,27 @@ mod tests {
             ]),
         ]);
         assert_eq!(nested.minimum_approvals(), 3);
+    }
+
+    #[test]
+    fn test_max_nesting_depth_validation() {
+        fn build_nested(depth: usize) -> RequirementNode {
+            if depth == 0 {
+                RequirementNode::threshold(1, "leaf")
+            } else {
+                RequirementNode::all(vec![build_nested(depth - 1)])
+            }
+        }
+
+        let valid = build_nested(MAX_NESTING_DEPTH);
+        assert!(valid.validate().is_ok());
+
+        let invalid = build_nested(MAX_NESTING_DEPTH + 1);
+        assert!(matches!(
+            invalid.validate(),
+            Err(QuorumValidationError::MaxNestingDepthExceeded {
+                max: MAX_NESTING_DEPTH
+            })
+        ));
     }
 }

@@ -12,6 +12,10 @@ use uuid::Uuid;
 use crate::approval::{ApprovalWorkflow, WorkflowStatus, WorkflowStore};
 use crate::Result;
 
+const MAX_CURRENT_STAGE_LEN: usize = 256;
+const DEFAULT_MAX_TRACKED_WORKFLOWS: usize = 10_000;
+const MIN_HEARTBEAT_INTERVAL_SECS: i64 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatConfig {
     pub interval: Duration,
@@ -44,9 +48,13 @@ impl HeartbeatDetails {
         approvals_collected: u32,
         approvals_required: u32,
     ) -> Self {
+        let mut stage: String = current_stage.into();
+        if stage.len() > MAX_CURRENT_STAGE_LEN {
+            stage.truncate(MAX_CURRENT_STAGE_LEN);
+        }
         Self {
             progress_percent: progress_percent.min(100),
-            current_stage: current_stage.into(),
+            current_stage: stage,
             approvals_collected,
             approvals_required,
         }
@@ -57,7 +65,7 @@ impl HeartbeatDetails {
         let collected = workflow.approval_count();
         let progress = match required {
             0 => 0,
-            r => ((collected * 100) / r).min(100) as u8,
+            r => (collected.saturating_mul(100) / r).min(100) as u8,
         };
 
         Self {
@@ -125,6 +133,14 @@ impl WorkflowHeartbeat {
 pub struct HeartbeatTracker {
     heartbeats: RwLock<HashMap<Uuid, WorkflowHeartbeat>>,
     default_config: HeartbeatConfig,
+    max_capacity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatError {
+    CapacityExceeded { current: usize, max: usize },
+    RateLimited,
+    NotRegistered,
 }
 
 impl HeartbeatTracker {
@@ -132,25 +148,54 @@ impl HeartbeatTracker {
         Self {
             heartbeats: RwLock::new(HashMap::new()),
             default_config,
+            max_capacity: DEFAULT_MAX_TRACKED_WORKFLOWS,
         }
     }
 
-    pub fn register(&self, workflow_id: Uuid) {
-        self.register_with_config(workflow_id, self.default_config.clone());
+    pub fn with_max_capacity(mut self, max_capacity: usize) -> Self {
+        self.max_capacity = max_capacity;
+        self
     }
 
-    pub fn register_with_config(&self, workflow_id: Uuid, config: HeartbeatConfig) {
+    pub fn register(&self, workflow_id: Uuid) -> std::result::Result<(), HeartbeatError> {
+        self.register_with_config(workflow_id, self.default_config.clone())
+    }
+
+    pub fn register_with_config(
+        &self,
+        workflow_id: Uuid,
+        config: HeartbeatConfig,
+    ) -> std::result::Result<(), HeartbeatError> {
         let mut heartbeats = self.heartbeats.write();
+        if heartbeats.contains_key(&workflow_id) {
+            return Ok(());
+        }
+        if heartbeats.len() >= self.max_capacity {
+            return Err(HeartbeatError::CapacityExceeded {
+                current: heartbeats.len(),
+                max: self.max_capacity,
+            });
+        }
         heartbeats.insert(workflow_id, WorkflowHeartbeat::new(workflow_id, config));
+        Ok(())
     }
 
-    pub fn record(&self, workflow_id: Uuid, details: Option<HeartbeatDetails>) -> bool {
+    pub fn record(
+        &self,
+        workflow_id: Uuid,
+        details: Option<HeartbeatDetails>,
+    ) -> std::result::Result<(), HeartbeatError> {
         let mut heartbeats = self.heartbeats.write();
         if let Some(hb) = heartbeats.get_mut(&workflow_id) {
+            let now = Utc::now();
+            let elapsed = now.signed_duration_since(hb.last_heartbeat).num_seconds();
+            if elapsed < MIN_HEARTBEAT_INTERVAL_SECS {
+                return Err(HeartbeatError::RateLimited);
+            }
             hb.record(details);
-            true
+            Ok(())
         } else {
-            false
+            Err(HeartbeatError::NotRegistered)
         }
     }
 
@@ -192,6 +237,20 @@ impl Default for HeartbeatTracker {
     }
 }
 
+impl std::fmt::Display for HeartbeatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityExceeded { current, max } => {
+                write!(f, "capacity exceeded: {} of {} slots used", current, max)
+            }
+            Self::RateLimited => write!(f, "heartbeat rate limited"),
+            Self::NotRegistered => write!(f, "workflow not registered"),
+        }
+    }
+}
+
+impl std::error::Error for HeartbeatError {}
+
 pub struct HeartbeatChecker {
     tracker: Arc<HeartbeatTracker>,
     workflow_store: Arc<dyn WorkflowStore>,
@@ -218,13 +277,32 @@ impl HeartbeatChecker {
 
         for workflow_id in stale {
             if let Some(mut workflow) = self.workflow_store.get_workflow(&workflow_id).await? {
+                let original_status = workflow.status;
                 if workflow.status == WorkflowStatus::Pending {
                     workflow.status = WorkflowStatus::TimedOut;
                     workflow.rejection_reason = Some("Heartbeat timeout".into());
                     workflow.completed_at = Some(Utc::now());
                     self.workflow_store.update_workflow(workflow).await?;
-                    timed_out.push(workflow_id);
-                    info!(workflow_id = %workflow_id, "Workflow timed out due to missed heartbeat");
+
+                    if let Some(updated) = self.workflow_store.get_workflow(&workflow_id).await? {
+                        if updated.status != WorkflowStatus::TimedOut {
+                            warn!(
+                                workflow_id = %workflow_id,
+                                expected = "TimedOut",
+                                actual = ?updated.status,
+                                "Workflow status changed after update (possible race)"
+                            );
+                        } else {
+                            timed_out.push(workflow_id);
+                            info!(workflow_id = %workflow_id, "Workflow timed out due to missed heartbeat");
+                        }
+                    }
+                } else if original_status != WorkflowStatus::Pending {
+                    info!(
+                        workflow_id = %workflow_id,
+                        status = ?original_status,
+                        "Skipping stale workflow already transitioned"
+                    );
                 }
             }
             self.tracker.unregister(workflow_id);
@@ -302,15 +380,16 @@ mod tests {
         let tracker = HeartbeatTracker::default();
         let workflow_id = Uuid::new_v4();
 
-        tracker.register(workflow_id);
+        tracker.register(workflow_id).unwrap();
         assert_eq!(tracker.active_count(), 1);
 
+        std::thread::sleep(Duration::from_secs(2));
         let recorded = tracker.record(workflow_id, None);
-        assert!(recorded);
+        assert!(recorded.is_ok());
 
         let unregistered_id = Uuid::new_v4();
         let not_recorded = tracker.record(unregistered_id, None);
-        assert!(!not_recorded);
+        assert!(matches!(not_recorded, Err(HeartbeatError::NotRegistered)));
 
         tracker.unregister(workflow_id);
         assert_eq!(tracker.active_count(), 0);
@@ -326,7 +405,7 @@ mod tests {
         let tracker = HeartbeatTracker::new(config);
         let workflow_id = Uuid::new_v4();
 
-        tracker.register(workflow_id);
+        tracker.register(workflow_id).unwrap();
         assert!(tracker.find_stale().is_empty());
 
         std::thread::sleep(Duration::from_millis(50));
@@ -359,7 +438,7 @@ mod tests {
         let workflow_id = workflow.id;
         workflow_store.create_workflow(workflow).await.unwrap();
 
-        tracker.register(workflow_id);
+        tracker.register(workflow_id).unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -403,5 +482,48 @@ mod tests {
         assert_eq!(details.approvals_collected, 1);
         assert_eq!(details.approvals_required, 3);
         assert_eq!(details.progress_percent, 33);
+    }
+
+    #[test]
+    fn test_heartbeat_details_truncates_long_stage() {
+        let long_stage = "x".repeat(500);
+        let details = HeartbeatDetails::new(50, long_stage, 1, 2);
+        assert_eq!(details.current_stage.len(), MAX_CURRENT_STAGE_LEN);
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_capacity_limit() {
+        let tracker = HeartbeatTracker::new(HeartbeatConfig::default()).with_max_capacity(2);
+
+        tracker.register(Uuid::new_v4()).unwrap();
+        tracker.register(Uuid::new_v4()).unwrap();
+
+        let result = tracker.register(Uuid::new_v4());
+        assert!(matches!(
+            result,
+            Err(HeartbeatError::CapacityExceeded { current: 2, max: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_rate_limiting() {
+        let tracker = HeartbeatTracker::default();
+        let workflow_id = Uuid::new_v4();
+
+        tracker.register(workflow_id).unwrap();
+
+        let result = tracker.record(workflow_id, None);
+        assert!(matches!(result, Err(HeartbeatError::RateLimited)));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_allows_reregistration() {
+        let tracker = HeartbeatTracker::new(HeartbeatConfig::default()).with_max_capacity(1);
+        let workflow_id = Uuid::new_v4();
+
+        tracker.register(workflow_id).unwrap();
+        let result = tracker.register(workflow_id);
+        assert!(result.is_ok());
+        assert_eq!(tracker.active_count(), 1);
     }
 }
