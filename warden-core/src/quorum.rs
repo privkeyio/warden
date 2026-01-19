@@ -612,4 +612,46 @@ mod tests {
         assert!(groups.contains("cto"));
         assert_eq!(groups.len(), 3);
     }
+
+    #[test]
+    fn test_minimum_approvals() {
+        assert_eq!(
+            RequirementNode::threshold(3, "treasury").minimum_approvals(),
+            3
+        );
+
+        let all_req = RequirementNode::all(vec![
+            RequirementNode::threshold(2, "finance"),
+            RequirementNode::threshold(1, "compliance"),
+        ]);
+        assert_eq!(all_req.minimum_approvals(), 3);
+
+        let any_req = RequirementNode::any(vec![
+            RequirementNode::threshold(5, "executive"),
+            RequirementNode::threshold(2, "board"),
+        ]);
+        assert_eq!(any_req.minimum_approvals(), 2);
+
+        let kof_req = RequirementNode::k_of(
+            2,
+            vec![
+                RequirementNode::threshold(3, "security"),
+                RequirementNode::threshold(1, "ops"),
+                RequirementNode::threshold(2, "dev"),
+            ],
+        );
+        assert_eq!(kof_req.minimum_approvals(), 3);
+
+        let nested = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "initiator"),
+            RequirementNode::any(vec![
+                RequirementNode::threshold(3, "high_security"),
+                RequirementNode::all(vec![
+                    RequirementNode::threshold(1, "finance"),
+                    RequirementNode::threshold(1, "compliance"),
+                ]),
+            ]),
+        ]);
+        assert_eq!(nested.minimum_approvals(), 3);
+    }
 }
