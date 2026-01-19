@@ -124,6 +124,12 @@ impl TaskHandle {
         }
     }
 
+    pub async fn done_timeout(&self, timeout: std::time::Duration) -> Result<(), ()> {
+        tokio::time::timeout(timeout, self.done())
+            .await
+            .map_err(|_| ())
+    }
+
     pub fn error(&self) -> Option<Error> {
         self.error.lock().clone()
     }
@@ -134,9 +140,9 @@ impl TaskHandle {
 
     pub fn abort(&self) {
         if let Some(handle) = self.join_handle.lock().take() {
-            handle.abort();
             self.done.store(true, Ordering::Release);
             self.done_notify.notify_waiters();
+            handle.abort();
         }
     }
 }
@@ -342,5 +348,38 @@ mod tests {
         handle1.done().await;
         assert!(handle1.is_done());
         assert!(handle1.error().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_done_timeout_success() {
+        let handle = TaskHandle::spawn(|_token| async move { Ok(()) });
+
+        let result = handle.done_timeout(Duration::from_secs(1)).await;
+        assert!(result.is_ok());
+        assert!(handle.is_done());
+    }
+
+    #[tokio::test]
+    async fn test_done_timeout_expires() {
+        let handle = TaskHandle::spawn(|_token| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        let result = handle.done_timeout(Duration::from_millis(50)).await;
+        assert!(result.is_err());
+        assert!(!handle.is_done());
+    }
+
+    #[tokio::test]
+    async fn test_abort_sets_done_before_abort() {
+        let handle = TaskHandle::spawn(|_token| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.abort();
+        assert!(handle.is_done());
     }
 }
