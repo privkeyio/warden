@@ -126,6 +126,25 @@ impl TaskHandle {
         self.error.lock().take()
     }
 
+    pub async fn join(self) -> Result<(), Error> {
+        self.done().await;
+        let handle = self.join_handle.lock().take();
+        if let Some(h) = handle {
+            match h.await {
+                Ok(()) => {}
+                Err(join_err) => {
+                    if join_err.is_panic() {
+                        std::panic::resume_unwind(join_err.into_panic());
+                    }
+                }
+            }
+        }
+        match self.take_error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     pub fn abort(&self) {
         if let Some(handle) = self.join_handle.lock().take() {
             self.done.store(true, Ordering::Release);

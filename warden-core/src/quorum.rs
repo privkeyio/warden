@@ -7,6 +7,8 @@ use crate::approval::{Approval, ApprovalDecision};
 
 pub type GroupId = String;
 
+const MAX_NESTING_DEPTH: usize = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequirementNode {
@@ -47,6 +49,16 @@ impl RequirementNode {
     }
 
     pub fn validate(&self) -> Result<(), QuorumValidationError> {
+        self.validate_with_depth(0)
+    }
+
+    fn validate_with_depth(&self, depth: usize) -> Result<(), QuorumValidationError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(QuorumValidationError::MaxNestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+
         match self {
             RequirementNode::Threshold { threshold, group } => {
                 if *threshold == 0 {
@@ -57,28 +69,52 @@ impl RequirementNode {
                 }
             }
             RequirementNode::All { requirements } | RequirementNode::Any { requirements } => {
-                if requirements.is_empty() {
-                    return Err(QuorumValidationError::EmptyRequirements);
-                }
-                for req in requirements {
-                    req.validate()?;
-                }
+                self.validate_children(requirements, depth, None)?;
             }
             RequirementNode::KOf { k, requirements } => {
                 if *k == 0 {
                     return Err(QuorumValidationError::ZeroThreshold);
                 }
-                if requirements.is_empty() {
-                    return Err(QuorumValidationError::EmptyRequirements);
-                }
-                if *k > requirements.len() as u32 {
-                    return Err(QuorumValidationError::ThresholdExceedsRequirements {
-                        k: *k,
-                        count: requirements.len() as u32,
+                self.validate_children(requirements, depth, Some(*k))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_children(
+        &self,
+        requirements: &[RequirementNode],
+        depth: usize,
+        k: Option<u32>,
+    ) -> Result<(), QuorumValidationError> {
+        if requirements.is_empty() {
+            return Err(QuorumValidationError::EmptyRequirements);
+        }
+        if let Some(k) = k {
+            if k > requirements.len() as u32 {
+                return Err(QuorumValidationError::ThresholdExceedsRequirements {
+                    k,
+                    count: requirements.len() as u32,
+                });
+            }
+        }
+        Self::check_duplicate_sibling_groups(requirements)?;
+        for req in requirements {
+            req.validate_with_depth(depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn check_duplicate_sibling_groups(
+        requirements: &[RequirementNode],
+    ) -> Result<(), QuorumValidationError> {
+        let mut seen_groups = HashSet::new();
+        for req in requirements {
+            if let RequirementNode::Threshold { group, .. } = req {
+                if !seen_groups.insert(group.clone()) {
+                    return Err(QuorumValidationError::DuplicateSiblingGroupId {
+                        group_id: group.clone(),
                     });
-                }
-                for req in requirements {
-                    req.validate()?;
                 }
             }
         }
@@ -89,6 +125,26 @@ impl RequirementNode {
         let mut groups = HashSet::new();
         self.collect_groups(&mut groups);
         groups
+    }
+
+    pub fn minimum_approvals(&self) -> u32 {
+        match self {
+            RequirementNode::Threshold { threshold, .. } => *threshold,
+            RequirementNode::All { requirements } => {
+                requirements.iter().map(|r| r.minimum_approvals()).sum()
+            }
+            RequirementNode::Any { requirements } => requirements
+                .iter()
+                .map(|r| r.minimum_approvals())
+                .min()
+                .unwrap_or(0),
+            RequirementNode::KOf { k, requirements } => {
+                let mut mins: Vec<u32> =
+                    requirements.iter().map(|r| r.minimum_approvals()).collect();
+                mins.sort_unstable();
+                mins.iter().take(*k as usize).sum()
+            }
+        }
     }
 
     fn collect_groups(&self, groups: &mut HashSet<GroupId>) {
@@ -113,6 +169,8 @@ pub enum QuorumValidationError {
     EmptyGroup,
     EmptyRequirements,
     ThresholdExceedsRequirements { k: u32, count: u32 },
+    DuplicateSiblingGroupId { group_id: GroupId },
+    MaxNestingDepthExceeded { max: usize },
 }
 
 impl std::fmt::Display for QuorumValidationError {
@@ -123,6 +181,12 @@ impl std::fmt::Display for QuorumValidationError {
             Self::EmptyRequirements => write!(f, "requirements list cannot be empty"),
             Self::ThresholdExceedsRequirements { k, count } => {
                 write!(f, "k ({}) exceeds requirement count ({})", k, count)
+            }
+            Self::DuplicateSiblingGroupId { group_id } => {
+                write!(f, "duplicate GroupId in sibling requirements: {}", group_id)
+            }
+            Self::MaxNestingDepthExceeded { max } => {
+                write!(f, "nesting depth exceeds maximum of {}", max)
             }
         }
     }
@@ -499,6 +563,62 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_sibling_group_validation() {
+        // Duplicate GroupId in All should fail
+        let duplicate_all = RequirementNode::all(vec![
+            RequirementNode::threshold(2, "treasury"),
+            RequirementNode::threshold(3, "treasury"),
+        ]);
+        let result = duplicate_all.validate();
+        assert!(matches!(
+            result,
+            Err(QuorumValidationError::DuplicateSiblingGroupId { group_id }) if group_id == "treasury"
+        ));
+
+        // Duplicate GroupId in Any should fail
+        let duplicate_any = RequirementNode::any(vec![
+            RequirementNode::threshold(1, "security"),
+            RequirementNode::threshold(2, "security"),
+        ]);
+        assert!(matches!(
+            duplicate_any.validate(),
+            Err(QuorumValidationError::DuplicateSiblingGroupId { .. })
+        ));
+
+        // Duplicate GroupId in KOf should fail
+        let duplicate_kof = RequirementNode::k_of(
+            2,
+            vec![
+                RequirementNode::threshold(1, "compliance"),
+                RequirementNode::threshold(1, "compliance"),
+                RequirementNode::threshold(1, "finance"),
+            ],
+        );
+        assert!(matches!(
+            duplicate_kof.validate(),
+            Err(QuorumValidationError::DuplicateSiblingGroupId { .. })
+        ));
+
+        // Same GroupId at different nesting levels should be allowed
+        let nested_same_group = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "treasury"),
+            RequirementNode::any(vec![
+                RequirementNode::threshold(2, "treasury"), // Different level, OK
+                RequirementNode::threshold(1, "finance"),
+            ]),
+        ]);
+        assert!(nested_same_group.validate().is_ok());
+
+        // Different groups at same level should be allowed
+        let different_groups = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "treasury"),
+            RequirementNode::threshold(2, "finance"),
+            RequirementNode::threshold(1, "compliance"),
+        ]);
+        assert!(different_groups.validate().is_ok());
+    }
+
+    #[test]
     fn test_all_groups() {
         let requirement = RequirementNode::all(vec![
             RequirementNode::threshold(1, "finance"),
@@ -513,5 +633,69 @@ mod tests {
         assert!(groups.contains("ceo"));
         assert!(groups.contains("cto"));
         assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn test_minimum_approvals() {
+        assert_eq!(
+            RequirementNode::threshold(3, "treasury").minimum_approvals(),
+            3
+        );
+
+        let all_req = RequirementNode::all(vec![
+            RequirementNode::threshold(2, "finance"),
+            RequirementNode::threshold(1, "compliance"),
+        ]);
+        assert_eq!(all_req.minimum_approvals(), 3);
+
+        let any_req = RequirementNode::any(vec![
+            RequirementNode::threshold(5, "executive"),
+            RequirementNode::threshold(2, "board"),
+        ]);
+        assert_eq!(any_req.minimum_approvals(), 2);
+
+        let kof_req = RequirementNode::k_of(
+            2,
+            vec![
+                RequirementNode::threshold(3, "security"),
+                RequirementNode::threshold(1, "ops"),
+                RequirementNode::threshold(2, "dev"),
+            ],
+        );
+        assert_eq!(kof_req.minimum_approvals(), 3);
+
+        let nested = RequirementNode::all(vec![
+            RequirementNode::threshold(1, "initiator"),
+            RequirementNode::any(vec![
+                RequirementNode::threshold(3, "high_security"),
+                RequirementNode::all(vec![
+                    RequirementNode::threshold(1, "finance"),
+                    RequirementNode::threshold(1, "compliance"),
+                ]),
+            ]),
+        ]);
+        assert_eq!(nested.minimum_approvals(), 3);
+    }
+
+    #[test]
+    fn test_max_nesting_depth_validation() {
+        fn build_nested(depth: usize) -> RequirementNode {
+            if depth == 0 {
+                RequirementNode::threshold(1, "leaf")
+            } else {
+                RequirementNode::all(vec![build_nested(depth - 1)])
+            }
+        }
+
+        let valid = build_nested(MAX_NESTING_DEPTH);
+        assert!(valid.validate().is_ok());
+
+        let invalid = build_nested(MAX_NESTING_DEPTH + 1);
+        assert!(matches!(
+            invalid.validate(),
+            Err(QuorumValidationError::MaxNestingDepthExceeded {
+                max: MAX_NESTING_DEPTH
+            })
+        ));
     }
 }
