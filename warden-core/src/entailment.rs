@@ -250,11 +250,24 @@ impl SemanticPolicy {
     }
 
     pub fn difference(&self, other: &SemanticPolicy) -> Vec<Counterexample> {
-        self.rules
+        let mut examples: Vec<Counterexample> = self
+            .rules
             .iter()
             .filter(|rule| rule.action.is_permission_tier() && !self.is_covered_by(rule, other))
             .filter_map(|rule| generate_counterexample(&rule.condition))
-            .collect()
+            .collect();
+
+        if self.default_action.is_permission_tier() && !self.is_default_action_covered_by(other) {
+            if let Some(ce) = generate_counterexample(&NormalizedCondition::True) {
+                examples.push(ce);
+            }
+        }
+
+        examples
+    }
+
+    fn is_default_action_covered_by(&self, other: &SemanticPolicy) -> bool {
+        other.default_action.is_permission_tier()
     }
 
     pub fn find_redundant_rules(&self) -> Vec<RedundantRule> {
@@ -477,6 +490,15 @@ impl NormalizedCondition {
                 NormalizedCondition::AddressIn { list: l1 },
                 NormalizedCondition::AddressIn { list: l2 },
             ) => l1 == l2,
+
+            (
+                NormalizedCondition::AddressIn { list: l1 },
+                NormalizedCondition::AddressNotIn { list: l2 },
+            )
+            | (
+                NormalizedCondition::AddressNotIn { list: l2 },
+                NormalizedCondition::AddressIn { list: l1 },
+            ) => l1 != l2,
 
             (
                 NormalizedCondition::TimeWindow {

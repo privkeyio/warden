@@ -7,6 +7,7 @@ pub mod bundle;
 pub mod callback;
 pub mod compliance;
 pub mod config;
+pub mod context;
 pub mod enclave;
 pub mod entailment;
 pub mod error;
@@ -147,4 +148,8 @@ pub use entailment::{
     validate_policy_upgrade, Counterexample, EntailmentResult, NormalizedCondition,
     NormalizedHourRange, PolicyConflict, PolicyUpgradeValidation, RedundantRule, SemanticAction,
     SemanticPolicy, SemanticRule,
+};
+
+pub use context::{
+    BypassFlags, ContextRole, RequestContext, RequestExtensions, RetryOverride, TimeoutOverride,
 };

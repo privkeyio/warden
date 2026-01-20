@@ -44,6 +44,29 @@ impl Role {
     }
 }
 
+impl From<Role> for warden_core::context::ContextRole {
+    fn from(role: Role) -> Self {
+        use warden_core::context::ContextRole;
+        match role {
+            Role::Admin => ContextRole::Admin,
+            Role::Approver => ContextRole::Approver,
+            Role::Viewer => ContextRole::Viewer,
+        }
+    }
+}
+
+impl From<warden_core::context::ContextRole> for Role {
+    fn from(role: warden_core::context::ContextRole) -> Self {
+        use warden_core::context::ContextRole;
+        match role {
+            ContextRole::Admin => Role::Admin,
+            ContextRole::Approver => Role::Approver,
+            ContextRole::Viewer => Role::Viewer,
+            ContextRole::Service => Role::Admin,
+        }
+    }
+}
+
 pub const DEFAULT_ISSUER: &str = "warden";
 pub const DEFAULT_AUDIENCE: &str = "warden-api";
 
@@ -418,9 +441,6 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let user = AuthenticatedUser::from_request_parts(parts, state).await?;
-        if !user.role.can_access(Role::Viewer) {
-            return Err(AuthError::InsufficientPermissions);
-        }
         Ok(ViewerUser {
             subject: user.subject,
         })
@@ -708,5 +728,36 @@ mod tests {
         assert!(!state.is_token_revoked(&claims.jti));
         state.revoke_token(claims.jti.clone(), claims.exp);
         assert!(state.is_token_revoked(&claims.jti));
+    }
+
+    #[test]
+    fn test_role_to_context_role_conversion() {
+        use warden_core::context::ContextRole;
+
+        let admin: ContextRole = Role::Admin.into();
+        assert_eq!(admin, ContextRole::Admin);
+
+        let approver: ContextRole = Role::Approver.into();
+        assert_eq!(approver, ContextRole::Approver);
+
+        let viewer: ContextRole = Role::Viewer.into();
+        assert_eq!(viewer, ContextRole::Viewer);
+    }
+
+    #[test]
+    fn test_context_role_to_role_conversion() {
+        use warden_core::context::ContextRole;
+
+        let admin: Role = ContextRole::Admin.into();
+        assert_eq!(admin, Role::Admin);
+
+        let approver: Role = ContextRole::Approver.into();
+        assert_eq!(approver, Role::Approver);
+
+        let viewer: Role = ContextRole::Viewer.into();
+        assert_eq!(viewer, Role::Viewer);
+
+        let service: Role = ContextRole::Service.into();
+        assert_eq!(service, Role::Admin);
     }
 }
