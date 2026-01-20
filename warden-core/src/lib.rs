@@ -8,6 +8,7 @@ pub mod callback;
 pub mod compliance;
 pub mod config;
 pub mod enclave;
+pub mod entailment;
 pub mod error;
 pub mod escalation;
 pub mod evaluator;
@@ -140,4 +141,10 @@ pub use metrics::{LabeledMetrics, MetricsRecorder, PolicyMetrics};
 pub use hierarchy::{
     CycleError, EntityGraph, EntityId, EntityNode, HierarchyError, HierarchyValidator,
     RelationType, Role, RoleHierarchy, RoleId, TCNode, TransitiveClosure,
+};
+
+pub use entailment::{
+    validate_policy_upgrade, Counterexample, EntailmentResult, NormalizedCondition,
+    NormalizedHourRange, PolicyConflict, PolicyUpgradeValidation, RedundantRule, SemanticAction,
+    SemanticPolicy, SemanticRule,
 };
