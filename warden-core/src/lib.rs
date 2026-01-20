@@ -13,6 +13,7 @@ pub mod escalation;
 pub mod evaluator;
 pub mod group;
 pub mod heartbeat;
+pub mod hierarchy;
 pub mod lifecycle;
 pub mod metrics;
 pub mod notification;
@@ -135,3 +136,8 @@ pub use ssrf::{SsrfError, SsrfPolicy};
 pub use task::{CancellationToken, TaskHandle};
 
 pub use metrics::{LabeledMetrics, MetricsRecorder, PolicyMetrics};
+
+pub use hierarchy::{
+    CycleError, EntityGraph, EntityId, EntityNode, HierarchyError, HierarchyValidator,
+    RelationType, Role, RoleHierarchy, RoleId, TCNode, TransitiveClosure,
+};
