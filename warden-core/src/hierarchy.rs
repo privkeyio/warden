@@ -18,12 +18,46 @@ impl<K: fmt::Debug> fmt::Display for CycleError<K> {
 
 impl<K: fmt::Debug> std::error::Error for CycleError<K> {}
 
+const MAX_ID_LENGTH: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdValidationError {
+    Empty,
+    TooLong { len: usize, max: usize },
+}
+
+impl fmt::Display for IdValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "ID cannot be empty"),
+            Self::TooLong { len, max } => {
+                write!(f, "ID length {} exceeds maximum {}", len, max)
+            }
+        }
+    }
+}
+
+impl std::error::Error for IdValidationError {}
+
+fn validate_id(id: &str) -> Result<(), IdValidationError> {
+    if id.is_empty() {
+        return Err(IdValidationError::Empty);
+    }
+    if id.len() > MAX_ID_LENGTH {
+        return Err(IdValidationError::TooLong {
+            len: id.len(),
+            max: MAX_ID_LENGTH,
+        });
+    }
+    Ok(())
+}
+
 pub trait TCNode<K: Eq + Hash + Clone> {
     fn get_key(&self) -> K;
     fn out_edges(&self) -> Box<dyn Iterator<Item = &K> + '_>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransitiveClosure<K: Eq + Hash + Clone> {
     edges: HashMap<K, HashSet<K>>,
 }
@@ -77,37 +111,46 @@ impl<K: Eq + Hash + Clone> TransitiveClosure<K> {
     }
 
     fn dfs_visit<N: TCNode<K>>(
-        current: &K,
+        start: &K,
         node_map: &HashMap<K, &N>,
         visited: &mut HashSet<K>,
         path: &mut Vec<K>,
         path_set: &mut HashSet<K>,
         result: &mut HashSet<K>,
     ) -> Result<(), CycleError<K>> {
-        if path_set.contains(current) {
-            let cycle_start = path.iter().position(|k| k == current).unwrap();
-            let mut cycle_path: Vec<K> = path[cycle_start..].to_vec();
-            cycle_path.push(current.clone());
-            return Err(CycleError { path: cycle_path });
-        }
+        let mut stack = vec![(start.clone(), false)];
 
-        if visited.contains(current) {
-            return Ok(());
-        }
+        while let Some((current, is_exit)) = stack.pop() {
+            if is_exit {
+                path.pop();
+                path_set.remove(&current);
+                continue;
+            }
 
-        path.push(current.clone());
-        path_set.insert(current.clone());
-        visited.insert(current.clone());
-        result.insert(current.clone());
+            if path_set.contains(&current) {
+                let cycle_start = path.iter().position(|k| k == &current).unwrap();
+                let mut cycle_path: Vec<K> = path[cycle_start..].to_vec();
+                cycle_path.push(current);
+                return Err(CycleError { path: cycle_path });
+            }
 
-        if let Some(node) = node_map.get(current) {
-            for neighbor in node.out_edges() {
-                Self::dfs_visit(neighbor, node_map, visited, path, path_set, result)?;
+            if visited.contains(&current) {
+                continue;
+            }
+
+            path.push(current.clone());
+            path_set.insert(current.clone());
+            visited.insert(current.clone());
+            result.insert(current.clone());
+
+            stack.push((current.clone(), true));
+
+            if let Some(node) = node_map.get(&current) {
+                for neighbor in node.out_edges() {
+                    stack.push((neighbor.clone(), false));
+                }
             }
         }
-
-        path.pop();
-        path_set.remove(current);
 
         Ok(())
     }
@@ -183,7 +226,13 @@ impl<K: Eq + Hash + Clone> TransitiveClosure<K> {
 pub struct RoleId(pub String);
 
 impl RoleId {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Result<Self, IdValidationError> {
+        let id = id.into();
+        validate_id(&id)?;
+        Ok(Self(id))
+    }
+
+    pub fn new_unchecked(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 }
@@ -267,12 +316,10 @@ impl RoleHierarchy {
     pub fn get_all_permissions(&self, role_id: &RoleId) -> HashSet<String> {
         let mut permissions = HashSet::new();
 
-        // Collect permissions from the role itself
         if let Some(role) = self.roles.get(role_id) {
             permissions.extend(role.permissions.iter().cloned());
         }
 
-        // Collect permissions from all ancestor roles
         for ancestor_id in self.closure.get_descendants(role_id) {
             if let Some(ancestor) = self.roles.get(&ancestor_id) {
                 permissions.extend(ancestor.permissions.iter().cloned());
@@ -299,7 +346,13 @@ impl RoleHierarchy {
 pub struct EntityId(pub String);
 
 impl EntityId {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Result<Self, IdValidationError> {
+        let id = id.into();
+        validate_id(&id)?;
+        Ok(Self(id))
+    }
+
+    pub fn new_unchecked(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 }
@@ -514,41 +567,58 @@ impl<K: Eq + Hash + Clone + fmt::Debug> HierarchyValidator<K> {
 
     fn longest_from<N: TCNode<K>>(
         &self,
-        key: &K,
+        start: &K,
         node_map: &HashMap<K, &N>,
         memo: &mut HashMap<K, usize>,
         visiting: &mut HashSet<K>,
     ) -> usize {
-        if let Some(&depth) = memo.get(key) {
-            return depth;
-        }
+        let mut stack: Vec<(K, Vec<K>, usize, usize)> = Vec::new();
+        let mut result: Option<usize> = None;
 
-        if visiting.contains(key) {
-            // Cycle detected, return 0 to avoid infinite recursion
-            return 0;
-        }
+        let children: Vec<K> = node_map
+            .get(start)
+            .map(|n| n.out_edges().cloned().collect())
+            .unwrap_or_default();
 
-        visiting.insert(key.clone());
+        stack.push((start.clone(), children, 0, 0));
+        visiting.insert(start.clone());
 
-        let depth = match node_map.get(key) {
-            Some(node) => {
-                let edges: Vec<_> = node.out_edges().collect();
-                if edges.is_empty() {
-                    0 // Sink node
-                } else {
-                    1 + edges
-                        .iter()
-                        .map(|child| self.longest_from(child, node_map, memo, visiting))
-                        .max()
-                        .unwrap_or(0)
-                }
+        while let Some((_key, children, child_idx, max_depth)) = stack.last_mut() {
+            if let Some(depth) = result.take() {
+                *max_depth = (*max_depth).max(depth);
             }
-            None => 0, // Node not in map, treat as sink
-        };
 
-        visiting.remove(key);
-        memo.insert(key.clone(), depth);
-        depth
+            if *child_idx < children.len() {
+                let child = children[*child_idx].clone();
+                *child_idx += 1;
+
+                if let Some(&cached) = memo.get(&child) {
+                    result = Some(cached);
+                    continue;
+                }
+
+                if visiting.contains(&child) {
+                    result = Some(0);
+                    continue;
+                }
+
+                let child_children: Vec<K> = node_map
+                    .get(&child)
+                    .map(|n| n.out_edges().cloned().collect())
+                    .unwrap_or_default();
+
+                visiting.insert(child.clone());
+                stack.push((child, child_children, 0, 0));
+            } else {
+                let (key, children, _, max_depth) = stack.pop().unwrap();
+                let depth = if children.is_empty() { 0 } else { 1 + max_depth };
+                visiting.remove(&key);
+                memo.insert(key, depth);
+                result = Some(depth);
+            }
+        }
+
+        result.unwrap_or(0)
     }
 
     pub fn would_create_cycle(&self, from: &K, to: &K) -> bool {
@@ -611,10 +681,10 @@ mod tests {
 
         let hierarchy = RoleHierarchy::build(roles).unwrap();
 
-        assert!(hierarchy.inherits_from(&RoleId::new("admin"), &RoleId::new("manager")));
-        assert!(hierarchy.inherits_from(&RoleId::new("admin"), &RoleId::new("approver")));
-        assert!(hierarchy.inherits_from(&RoleId::new("manager"), &RoleId::new("approver")));
-        assert!(!hierarchy.inherits_from(&RoleId::new("approver"), &RoleId::new("admin")));
+        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("admin"), &RoleId::new_unchecked("manager")));
+        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("admin"), &RoleId::new_unchecked("approver")));
+        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("manager"), &RoleId::new_unchecked("approver")));
+        assert!(!hierarchy.inherits_from(&RoleId::new_unchecked("approver"), &RoleId::new_unchecked("admin")));
     }
 
     #[test]
@@ -642,7 +712,7 @@ mod tests {
         ];
 
         let hierarchy = RoleHierarchy::build(roles).unwrap();
-        let admin_perms = hierarchy.get_all_permissions(&RoleId::new("admin"));
+        let admin_perms = hierarchy.get_all_permissions(&RoleId::new_unchecked("admin"));
 
         assert!(admin_perms.contains("delete"));
         assert!(admin_perms.contains("edit"));
@@ -679,18 +749,18 @@ mod tests {
         let graph = EntityGraph::build(nodes).unwrap();
 
         assert!(graph.is_reachable_via(
-            &EntityId::new("group-a"),
-            &EntityId::new("group-c"),
+            &EntityId::new_unchecked("group-a"),
+            &EntityId::new_unchecked("group-c"),
             &RelationType::ParentGroup
         ));
 
         assert!(!graph.is_reachable_via(
-            &EntityId::new("wallet-1"),
-            &EntityId::new("group-c"),
+            &EntityId::new_unchecked("wallet-1"),
+            &EntityId::new_unchecked("group-c"),
             &RelationType::ParentGroup
         ));
 
-        assert!(graph.is_reachable(&EntityId::new("wallet-1"), &EntityId::new("group-a")));
+        assert!(graph.is_reachable(&EntityId::new_unchecked("wallet-1"), &EntityId::new_unchecked("group-a")));
     }
 
     #[test]
@@ -721,5 +791,66 @@ mod tests {
 
         let result = closure.add_edge("a".to_string(), "a".to_string());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_role_id_validation_empty() {
+        let result = RoleId::new("");
+        assert!(matches!(result, Err(IdValidationError::Empty)));
+    }
+
+    #[test]
+    fn test_role_id_validation_too_long() {
+        let long_id = "x".repeat(257);
+        let result = RoleId::new(long_id);
+        assert!(matches!(
+            result,
+            Err(IdValidationError::TooLong { len: 257, max: 256 })
+        ));
+    }
+
+    #[test]
+    fn test_role_id_validation_valid() {
+        let result = RoleId::new("valid-role-id");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_entity_id_validation_empty() {
+        let result = EntityId::new("");
+        assert!(matches!(result, Err(IdValidationError::Empty)));
+    }
+
+    #[test]
+    fn test_entity_id_validation_too_long() {
+        let long_id = "x".repeat(257);
+        let result = EntityId::new(long_id);
+        assert!(matches!(
+            result,
+            Err(IdValidationError::TooLong { len: 257, max: 256 })
+        ));
+    }
+
+    #[test]
+    fn test_entity_id_validation_valid() {
+        let result = EntityId::new("valid-entity-id");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deep_hierarchy_no_stack_overflow() {
+        let depth = 1000;
+        let mut roles: Vec<Role> = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let role_id = format!("role-{}", i);
+            let mut role = Role::new(role_id.as_str(), format!("Role {}", i));
+            if i > 0 {
+                role = role.with_parent(format!("role-{}", i - 1).as_str());
+            }
+            roles.push(role);
+        }
+
+        let result = RoleHierarchy::build(roles);
+        assert!(result.is_ok());
     }
 }
