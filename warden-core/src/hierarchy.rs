@@ -611,7 +611,11 @@ impl<K: Eq + Hash + Clone + fmt::Debug> HierarchyValidator<K> {
                 stack.push((child, child_children, 0, 0));
             } else {
                 let (key, children, _, max_depth) = stack.pop().unwrap();
-                let depth = if children.is_empty() { 0 } else { 1 + max_depth };
+                let depth = if children.is_empty() {
+                    0
+                } else {
+                    1 + max_depth
+                };
                 visiting.remove(&key);
                 memo.insert(key, depth);
                 result = Some(depth);
@@ -681,10 +685,22 @@ mod tests {
 
         let hierarchy = RoleHierarchy::build(roles).unwrap();
 
-        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("admin"), &RoleId::new_unchecked("manager")));
-        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("admin"), &RoleId::new_unchecked("approver")));
-        assert!(hierarchy.inherits_from(&RoleId::new_unchecked("manager"), &RoleId::new_unchecked("approver")));
-        assert!(!hierarchy.inherits_from(&RoleId::new_unchecked("approver"), &RoleId::new_unchecked("admin")));
+        assert!(hierarchy.inherits_from(
+            &RoleId::new_unchecked("admin"),
+            &RoleId::new_unchecked("manager")
+        ));
+        assert!(hierarchy.inherits_from(
+            &RoleId::new_unchecked("admin"),
+            &RoleId::new_unchecked("approver")
+        ));
+        assert!(hierarchy.inherits_from(
+            &RoleId::new_unchecked("manager"),
+            &RoleId::new_unchecked("approver")
+        ));
+        assert!(!hierarchy.inherits_from(
+            &RoleId::new_unchecked("approver"),
+            &RoleId::new_unchecked("admin")
+        ));
     }
 
     #[test]
@@ -760,7 +776,10 @@ mod tests {
             &RelationType::ParentGroup
         ));
 
-        assert!(graph.is_reachable(&EntityId::new_unchecked("wallet-1"), &EntityId::new_unchecked("group-a")));
+        assert!(graph.is_reachable(
+            &EntityId::new_unchecked("wallet-1"),
+            &EntityId::new_unchecked("group-a")
+        ));
     }
 
     #[test]
