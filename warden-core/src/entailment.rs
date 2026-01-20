@@ -39,7 +39,10 @@ impl From<&Action> for SemanticAction {
 
 impl SemanticAction {
     pub fn is_permission_tier(self) -> bool {
-        matches!(self, SemanticAction::Allow | SemanticAction::RequireApproval)
+        matches!(
+            self,
+            SemanticAction::Allow | SemanticAction::RequireApproval
+        )
     }
 }
 
@@ -553,7 +556,12 @@ fn patterns_may_overlap(a: &str, b: &str) -> bool {
         return true;
     }
 
-    match (a.strip_suffix('*'), b.strip_suffix('*'), a.strip_prefix('*'), b.strip_prefix('*')) {
+    match (
+        a.strip_suffix('*'),
+        b.strip_suffix('*'),
+        a.strip_prefix('*'),
+        b.strip_prefix('*'),
+    ) {
         (Some(ap), Some(bp), _, _) => ap.starts_with(bp) || bp.starts_with(ap),
         (_, _, Some(as_), Some(bs)) => as_.ends_with(bs) || bs.ends_with(as_),
         (Some(_), None, _, Some(_)) | (None, Some(_), Some(_), _) => true,
