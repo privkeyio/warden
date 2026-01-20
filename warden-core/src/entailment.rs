@@ -257,9 +257,7 @@ impl SemanticPolicy {
             .filter_map(|rule| generate_counterexample(&rule.condition))
             .collect();
 
-        if self.default_action.is_permission_tier()
-            && !self.is_default_action_covered_by(other)
-        {
+        if self.default_action.is_permission_tier() && !self.is_default_action_covered_by(other) {
             if let Some(ce) = generate_counterexample(&NormalizedCondition::True) {
                 examples.push(ce);
             }
