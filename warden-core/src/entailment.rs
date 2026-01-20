@@ -38,14 +38,8 @@ impl From<&Action> for SemanticAction {
 }
 
 impl SemanticAction {
-    /// Returns true if this action grants a permission (Allow or RequireApproval).
-    /// Both Allow and RequireApproval are considered permission tiers that can
-    /// enable requests to proceed, unlike Deny which blocks them.
     pub fn is_permission_tier(self) -> bool {
-        matches!(
-            self,
-            SemanticAction::Allow | SemanticAction::RequireApproval
-        )
+        matches!(self, SemanticAction::Allow | SemanticAction::RequireApproval)
     }
 }
 
@@ -224,23 +218,18 @@ fn normalize_time(time: &TimeCondition) -> NormalizedCondition {
 
 impl SemanticPolicy {
     pub fn entails(&self, other: &SemanticPolicy) -> EntailmentResult {
-        // Check all rules that grant permissions (Allow or RequireApproval)
         for (i, rule) in self.rules.iter().enumerate() {
-            if rule.action.is_permission_tier() {
-                let covered = self.is_permission_tier_covered_by(rule, other);
-                if !covered {
-                    return EntailmentResult::DoesNotEntail {
-                        reason: format!(
-                            "rule '{}' (index {}) grants permissions not covered by other policy",
-                            rule.id, i
-                        ),
-                    };
-                }
+            if rule.action.is_permission_tier() && !self.is_covered_by(rule, other) {
+                return EntailmentResult::DoesNotEntail {
+                    reason: format!(
+                        "rule '{}' (index {}) grants permissions not covered by other policy",
+                        rule.id, i
+                    ),
+                };
             }
         }
 
-        // Check if default action grants permissions
-        if self.default_action.is_permission_tier() && !self.default_covered_by(other) {
+        if self.default_action.is_permission_tier() && !other.default_action.is_permission_tier() {
             return EntailmentResult::DoesNotEntail {
                 reason: "default action permits requests not covered by other policy".into(),
             };
@@ -249,11 +238,7 @@ impl SemanticPolicy {
         EntailmentResult::Entails
     }
 
-    /// Checks if a rule granting permissions is covered by the other policy.
-    /// A permission-granting rule (Allow or RequireApproval) is covered if the
-    /// other policy has a default permission tier or has a permission-granting
-    /// rule with a superset condition.
-    fn is_permission_tier_covered_by(&self, rule: &SemanticRule, other: &SemanticPolicy) -> bool {
+    fn is_covered_by(&self, rule: &SemanticRule, other: &SemanticPolicy) -> bool {
         other.default_action.is_permission_tier()
             || other.rules.iter().any(|other_rule| {
                 other_rule.action.is_permission_tier()
@@ -261,27 +246,12 @@ impl SemanticPolicy {
             })
     }
 
-    /// Checks if the default permission action is covered by the other policy.
-    fn default_covered_by(&self, other: &SemanticPolicy) -> bool {
-        other.default_action.is_permission_tier()
-    }
-
-    /// Returns counterexamples showing requests that would be permitted by this
-    /// policy but not by the other policy. Includes both Allow and RequireApproval
-    /// actions as permission-granting.
     pub fn difference(&self, other: &SemanticPolicy) -> Vec<Counterexample> {
-        let mut examples = Vec::new();
-
-        for rule in &self.rules {
-            if rule.action.is_permission_tier() && !self.is_permission_tier_covered_by(rule, other)
-            {
-                if let Some(ce) = generate_counterexample(&rule.condition) {
-                    examples.push(ce);
-                }
-            }
-        }
-
-        examples
+        self.rules
+            .iter()
+            .filter(|rule| rule.action.is_permission_tier() && !self.is_covered_by(rule, other))
+            .filter_map(|rule| generate_counterexample(&rule.condition))
+            .collect()
     }
 
     pub fn find_redundant_rules(&self) -> Vec<RedundantRule> {
@@ -344,6 +314,43 @@ pub struct PolicyConflict {
     pub action_b: SemanticAction,
 }
 
+fn bound_gte(inner: &Option<u64>, outer: &Option<u64>) -> bool {
+    match (inner, outer) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(b)) => a >= b,
+    }
+}
+
+fn bound_lte(inner: &Option<u64>, outer: &Option<u64>) -> bool {
+    match (inner, outer) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(b)) => a <= b,
+    }
+}
+
+fn optional_subset<T, F>(inner: &Option<T>, outer: &Option<T>, check: F) -> bool
+where
+    F: FnOnce(&T, &T) -> bool,
+{
+    match (inner, outer) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(b)) => check(a, b),
+    }
+}
+
+fn optional_overlaps<T, F>(a: &Option<T>, b: &Option<T>, check: F) -> bool
+where
+    F: FnOnce(&T, &T) -> bool,
+{
+    match (a, b) {
+        (None, _) | (_, None) => true,
+        (Some(x), Some(y)) => check(x, y),
+    }
+}
+
 impl NormalizedCondition {
     pub fn is_subset_of(&self, other: &NormalizedCondition) -> bool {
         match (self, other) {
@@ -360,19 +367,7 @@ impl NormalizedCondition {
                     min: min2,
                     max: max2,
                 },
-            ) => {
-                let lower_ok = match (min1, min2) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(a), Some(b)) => a >= b,
-                };
-                let upper_ok = match (max1, max2) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(a), Some(b)) => a <= b,
-                };
-                lower_ok && upper_ok
-            }
+            ) => bound_gte(min1, min2) && bound_lte(max1, max2),
 
             (
                 NormalizedCondition::SourceWallet { patterns: p1 },
@@ -409,20 +404,10 @@ impl NormalizedCondition {
                     hours: h2,
                 },
             ) => {
-                let days_ok = match (d1, d2) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(a), Some(b)) => a.is_subset(b),
-                };
-                let hours_ok = match (h1, h2) {
-                    (_, None) => true,
-                    (None, Some(_)) => false,
-                    (Some(a), Some(b)) => hour_range_subset(a, b),
-                };
-                days_ok && hours_ok
+                optional_subset(d1, d2, |a, b| a.is_subset(b))
+                    && optional_subset(h1, h2, hour_range_subset)
             }
 
-            // And-vs-And: self is subset if every constraint in other is implied by some constraint in self
             (NormalizedCondition::And(self_parts), NormalizedCondition::And(other_parts)) => {
                 other_parts.iter().all(|other_cond| {
                     self_parts
@@ -500,15 +485,8 @@ impl NormalizedCondition {
                     hours: h2,
                 },
             ) => {
-                let days_overlap = match (d1, d2) {
-                    (None, _) | (_, None) => true,
-                    (Some(a), Some(b)) => !a.is_disjoint(b),
-                };
-                let hours_overlap = match (h1, h2) {
-                    (None, _) | (_, None) => true,
-                    (Some(a), Some(b)) => hour_ranges_overlap(a, b),
-                };
-                days_overlap && hours_overlap
+                optional_overlaps(d1, d2, |a, b| !a.is_disjoint(b))
+                    && optional_overlaps(h1, h2, hour_ranges_overlap)
             }
 
             (NormalizedCondition::And(parts), other) | (other, NormalizedCondition::And(parts)) => {
@@ -529,16 +507,12 @@ fn hour_range_subset(inner: &NormalizedHourRange, outer: &NormalizedHourRange) -
     let inner_wraps = inner.start > inner.end;
 
     match (outer_wraps, inner_wraps) {
-        // Neither wraps: simple containment check
         (false, false) => inner.start >= outer.start && inner.end <= outer.end,
-        // Outer wraps but inner doesn't: inner must fit entirely in one segment
         (true, false) => {
             (inner.start >= outer.start && inner.end >= outer.start)
                 || (inner.start <= outer.end && inner.end <= outer.end)
         }
-        // Both wrap: inner must be contained within outer's wrapped range
         (true, true) => inner.start >= outer.start && inner.end <= outer.end,
-        // Inner wraps but outer doesn't: impossible to be a subset
         (false, true) => false,
     }
 }
@@ -579,25 +553,14 @@ fn patterns_may_overlap(a: &str, b: &str) -> bool {
         return true;
     }
 
-    let a_suffix_wild = a.strip_suffix('*');
-    let b_suffix_wild = b.strip_suffix('*');
-    let a_prefix_wild = a.strip_prefix('*');
-    let b_prefix_wild = b.strip_prefix('*');
-
-    match (a_suffix_wild, b_suffix_wild, a_prefix_wild, b_prefix_wild) {
-        // Both are suffix wildcards: foo* vs bar*
+    match (a.strip_suffix('*'), b.strip_suffix('*'), a.strip_prefix('*'), b.strip_prefix('*')) {
         (Some(ap), Some(bp), _, _) => ap.starts_with(bp) || bp.starts_with(ap),
-        // Both are prefix wildcards: *foo vs *bar
         (_, _, Some(as_), Some(bs)) => as_.ends_with(bs) || bs.ends_with(as_),
-        // Suffix vs prefix wildcard: foo* vs *bar - may overlap if foo+bar is valid
         (Some(_), None, _, Some(_)) | (None, Some(_), Some(_), _) => true,
-        // Suffix wildcard vs literal
         (Some(ap), None, _, _) => b.starts_with(ap),
         (None, Some(bp), _, _) => a.starts_with(bp),
-        // Prefix wildcard vs literal
         (_, _, Some(as_), None) => b.ends_with(as_),
         (_, _, None, Some(bs)) => a.ends_with(bs),
-        // Both literals
         _ => a == b,
     }
 }
