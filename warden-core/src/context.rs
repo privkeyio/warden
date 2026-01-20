@@ -15,12 +15,18 @@ pub enum ContextRole {
     Service,
 }
 
+impl ContextRole {
+    pub fn is_admin(&self) -> bool {
+        matches!(self, ContextRole::Admin)
+    }
+}
+
 #[derive(Clone)]
 pub struct RequestContext {
-    pub user_id: String,
-    pub role: ContextRole,
-    pub audit_id: Uuid,
-    pub trace_id: String,
+    user_id: String,
+    role: ContextRole,
+    audit_id: Uuid,
+    trace_id: String,
 }
 
 impl std::fmt::Debug for RequestContext {
@@ -57,6 +63,22 @@ impl RequestContext {
     pub fn service(service_name: impl Into<String>) -> Self {
         Self::new(service_name, ContextRole::Service)
     }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn role(&self) -> ContextRole {
+        self.role
+    }
+
+    pub fn audit_id(&self) -> Uuid {
+        self.audit_id
+    }
+
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,12 +111,29 @@ impl TimeoutOverride {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassError {
+    AdminRequired,
+}
+
+impl std::fmt::Display for BypassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BypassError::AdminRequired => {
+                write!(f, "bypass flags require admin role")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BypassError {}
+
 #[derive(Debug, Clone, Default)]
 pub struct BypassFlags {
-    pub skip_rate_limit: bool,
-    pub skip_audit: bool,
-    pub skip_compliance: bool,
-    pub admin_override: bool,
+    skip_rate_limit: bool,
+    skip_audit: bool,
+    skip_compliance: bool,
+    admin_override: bool,
 }
 
 impl BypassFlags {
@@ -102,26 +141,58 @@ impl BypassFlags {
         Self::default()
     }
 
-    pub fn admin() -> Self {
-        Self {
-            admin_override: true,
-            ..Default::default()
+    fn require_admin(ctx: &RequestContext) -> Result<(), BypassError> {
+        if ctx.role().is_admin() {
+            Ok(())
+        } else {
+            Err(BypassError::AdminRequired)
         }
     }
 
-    pub fn with_skip_rate_limit(mut self) -> Self {
+    pub fn for_admin(ctx: &RequestContext) -> Result<Self, BypassError> {
+        Self::require_admin(ctx)?;
+        Ok(Self {
+            admin_override: true,
+            ..Default::default()
+        })
+    }
+
+    pub fn with_skip_rate_limit(mut self, ctx: &RequestContext) -> Result<Self, BypassError> {
+        Self::require_admin(ctx)?;
         self.skip_rate_limit = true;
-        self
+        Ok(self)
     }
 
-    pub fn with_skip_audit(mut self) -> Self {
+    pub fn with_skip_audit(mut self, ctx: &RequestContext) -> Result<Self, BypassError> {
+        Self::require_admin(ctx)?;
         self.skip_audit = true;
-        self
+        Ok(self)
     }
 
-    pub fn with_skip_compliance(mut self) -> Self {
+    pub fn with_skip_compliance(mut self, ctx: &RequestContext) -> Result<Self, BypassError> {
+        Self::require_admin(ctx)?;
         self.skip_compliance = true;
-        self
+        Ok(self)
+    }
+
+    pub fn skip_rate_limit(&self) -> bool {
+        self.skip_rate_limit
+    }
+
+    pub fn skip_audit(&self) -> bool {
+        self.skip_audit
+    }
+
+    pub fn skip_compliance(&self) -> bool {
+        self.skip_compliance
+    }
+
+    pub fn admin_override(&self) -> bool {
+        self.admin_override
+    }
+
+    pub fn has_any(&self) -> bool {
+        self.skip_rate_limit || self.skip_audit || self.skip_compliance || self.admin_override
     }
 }
 
@@ -206,9 +277,9 @@ mod tests {
     #[test]
     fn test_request_context_new() {
         let ctx = RequestContext::new("user123", ContextRole::Admin);
-        assert_eq!(ctx.user_id, "user123");
-        assert_eq!(ctx.role, ContextRole::Admin);
-        assert!(!ctx.trace_id.is_empty());
+        assert_eq!(ctx.user_id(), "user123");
+        assert_eq!(ctx.role(), ContextRole::Admin);
+        assert!(!ctx.trace_id().is_empty());
     }
 
     #[test]
@@ -217,15 +288,15 @@ mod tests {
         let ctx = RequestContext::new("user123", ContextRole::Approver)
             .with_audit_id(audit_id)
             .with_trace_id("trace-abc");
-        assert_eq!(ctx.audit_id, audit_id);
-        assert_eq!(ctx.trace_id, "trace-abc");
+        assert_eq!(ctx.audit_id(), audit_id);
+        assert_eq!(ctx.trace_id(), "trace-abc");
     }
 
     #[test]
     fn test_service_context() {
         let ctx = RequestContext::service("batch-processor");
-        assert_eq!(ctx.user_id, "batch-processor");
-        assert_eq!(ctx.role, ContextRole::Service);
+        assert_eq!(ctx.user_id(), "batch-processor");
+        assert_eq!(ctx.role(), ContextRole::Service);
     }
 
     #[test]
@@ -235,7 +306,7 @@ mod tests {
         ext.insert(ctx);
 
         let retrieved = ext.get::<RequestContext>().unwrap();
-        assert_eq!(retrieved.user_id, "user");
+        assert_eq!(retrieved.user_id(), "user");
     }
 
     #[test]
@@ -255,7 +326,8 @@ mod tests {
     #[test]
     fn test_extensions_remove() {
         let mut ext = RequestExtensions::new();
-        ext.insert(BypassFlags::admin());
+        let admin_ctx = RequestContext::new("admin", ContextRole::Admin);
+        ext.insert(BypassFlags::for_admin(&admin_ctx).unwrap());
 
         assert!(ext.contains::<BypassFlags>());
         let removed = ext.remove::<BypassFlags>();
@@ -278,12 +350,41 @@ mod tests {
     }
 
     #[test]
-    fn test_bypass_flags_builder() {
-        let flags = BypassFlags::none().with_skip_rate_limit().with_skip_audit();
-        assert!(flags.skip_rate_limit);
-        assert!(flags.skip_audit);
-        assert!(!flags.skip_compliance);
-        assert!(!flags.admin_override);
+    fn test_bypass_flags_builder_admin() {
+        let admin_ctx = RequestContext::new("admin", ContextRole::Admin);
+        let flags = BypassFlags::none()
+            .with_skip_rate_limit(&admin_ctx)
+            .unwrap()
+            .with_skip_audit(&admin_ctx)
+            .unwrap();
+        assert!(flags.skip_rate_limit());
+        assert!(flags.skip_audit());
+        assert!(!flags.skip_compliance());
+        assert!(!flags.admin_override());
+    }
+
+    #[test]
+    fn test_bypass_flags_requires_admin() {
+        let viewer_ctx = RequestContext::new("viewer", ContextRole::Viewer);
+        assert!(BypassFlags::for_admin(&viewer_ctx).is_err());
+        assert!(BypassFlags::none()
+            .with_skip_rate_limit(&viewer_ctx)
+            .is_err());
+        assert!(BypassFlags::none().with_skip_audit(&viewer_ctx).is_err());
+        assert!(BypassFlags::none()
+            .with_skip_compliance(&viewer_ctx)
+            .is_err());
+    }
+
+    #[test]
+    fn test_bypass_flags_for_admin() {
+        let admin_ctx = RequestContext::new("admin", ContextRole::Admin);
+        let flags = BypassFlags::for_admin(&admin_ctx).unwrap();
+        assert!(flags.admin_override());
+        assert!(!flags.skip_rate_limit());
+        assert!(!flags.skip_audit());
+        assert!(!flags.skip_compliance());
+        assert!(flags.has_any());
     }
 
     #[test]
@@ -302,5 +403,35 @@ mod tests {
 
         ext.clear();
         assert!(ext.is_empty());
+    }
+
+    #[test]
+    fn test_debug_redacts_pii() {
+        let ctx = RequestContext::new("sensitive-user-id", ContextRole::Admin)
+            .with_trace_id("sensitive-trace-id");
+        let debug_output = format!("{:?}", ctx);
+        assert!(
+            !debug_output.contains("sensitive-user-id"),
+            "Debug output should not contain user_id: {}",
+            debug_output
+        );
+        assert!(
+            !debug_output.contains("sensitive-trace-id"),
+            "Debug output should not contain trace_id: {}",
+            debug_output
+        );
+        assert!(
+            debug_output.contains("<redacted>"),
+            "Debug output should contain <redacted>: {}",
+            debug_output
+        );
+    }
+
+    #[test]
+    fn test_context_role_is_admin() {
+        assert!(ContextRole::Admin.is_admin());
+        assert!(!ContextRole::Approver.is_admin());
+        assert!(!ContextRole::Viewer.is_admin());
+        assert!(!ContextRole::Service.is_admin());
     }
 }
