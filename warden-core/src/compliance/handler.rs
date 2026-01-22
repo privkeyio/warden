@@ -25,65 +25,69 @@ impl<P: ComplianceProvider> ComplianceCallbackHandler<P> {
         {
             Ok(s) => s,
             Err(e) => {
-                return CallbackResponse {
-                    iss: self.provider.provider_name().into(),
-                    aud: "warden".into(),
-                    iat: Utc::now().timestamp(),
-                    jti: request.jti,
-                    decision: CallbackDecision::Retry,
-                    reason: Some(format!("Screening failed: {}", e)),
-                    metadata: HashMap::new(),
-                    retry_after_seconds: Some(30),
-                };
+                return self.make_response(
+                    request.jti,
+                    CallbackDecision::Retry,
+                    Some(format!("Screening failed: {}", e)),
+                    Some(30),
+                );
             }
         };
 
         if screening.risk_score > self.risk_threshold {
-            return CallbackResponse {
-                iss: self.provider.provider_name().into(),
-                aud: "warden".into(),
-                iat: Utc::now().timestamp(),
-                jti: request.jti,
-                decision: CallbackDecision::Reject,
-                reason: Some(format!(
+            return self.make_response(
+                request.jti,
+                CallbackDecision::Reject,
+                Some(format!(
                     "High risk destination: {} (score: {:.2})",
                     screening.risk_category.as_deref().unwrap_or("unknown"),
                     screening.risk_score
                 )),
-                metadata: HashMap::new(),
-                retry_after_seconds: None,
-            };
+                None,
+            );
         }
 
-        if screening
+        let has_critical_alert = screening
             .alerts
             .iter()
-            .any(|a| a.severity == AlertSeverity::High || a.severity == AlertSeverity::Critical)
-        {
-            return CallbackResponse {
-                iss: self.provider.provider_name().into(),
-                aud: "warden".into(),
-                iat: Utc::now().timestamp(),
-                jti: request.jti,
-                decision: CallbackDecision::Reject,
-                reason: Some("High severity compliance alert".into()),
-                metadata: HashMap::new(),
-                retry_after_seconds: None,
-            };
+            .any(|a| a.severity == AlertSeverity::High || a.severity == AlertSeverity::Critical);
+
+        if has_critical_alert {
+            return self.make_response(
+                request.jti,
+                CallbackDecision::Reject,
+                Some("High severity compliance alert".into()),
+                None,
+            );
         }
 
+        self.make_response(
+            request.jti,
+            CallbackDecision::Approve,
+            Some(format!(
+                "Screening passed (score: {:.2})",
+                screening.risk_score
+            )),
+            None,
+        )
+    }
+
+    fn make_response(
+        &self,
+        jti: String,
+        decision: CallbackDecision,
+        reason: Option<String>,
+        retry_after_seconds: Option<u32>,
+    ) -> CallbackResponse {
         CallbackResponse {
             iss: self.provider.provider_name().into(),
             aud: "warden".into(),
             iat: Utc::now().timestamp(),
-            jti: request.jti,
-            decision: CallbackDecision::Approve,
-            reason: Some(format!(
-                "Screening passed (score: {:.2})",
-                screening.risk_score
-            )),
+            jti,
+            decision,
+            reason,
             metadata: HashMap::new(),
-            retry_after_seconds: None,
+            retry_after_seconds,
         }
     }
 }

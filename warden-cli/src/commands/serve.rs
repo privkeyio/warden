@@ -43,7 +43,12 @@ pub async fn handle_serve_command(
     let timeout_handle = Arc::clone(&timeout_checker).spawn();
     tracing::info!("Started workflow timeout checker");
 
-    let auth_state = setup_auth_state(stores).await?;
+    let rate_limit = std::env::var("WARDEN_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+
+    let auth_state = setup_auth_state(stores, rate_limit).await?;
 
     let state = warden_api::AppState::new(
         Arc::clone(&stores.policy_store),
@@ -58,11 +63,6 @@ pub async fn handle_serve_command(
     );
     let app = warden_api::create_router(state);
     let addr = format_bind_address(host_trimmed, port);
-
-    let rate_limit = std::env::var("WARDEN_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
 
     let result = if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
         println!("Starting Warden API server on https://{}", addr);
@@ -111,19 +111,17 @@ fn setup_enclave(
         return Ok(None);
     }
 
-    if require_attestation {
-        let has_all_pcrs = pcr0.is_some() && pcr1.is_some() && pcr2.is_some();
-        if !has_all_pcrs {
-            eprintln!(
-                "Error: --require-attestation requires valid PCR configuration.\n\
-                 Please provide --pcr0, --pcr1, and --pcr2 with valid 96-character hex values."
-            );
-            std::process::exit(1);
-        }
-
-        let pcr0_val = pcr0.as_ref().unwrap();
-        let pcr1_val = pcr1.as_ref().unwrap();
-        let pcr2_val = pcr2.as_ref().unwrap();
+    let enclave_config = if require_attestation {
+        let (pcr0_val, pcr1_val, pcr2_val) = match (&pcr0, &pcr1, &pcr2) {
+            (Some(p0), Some(p1), Some(p2)) => (p0, p1, p2),
+            _ => {
+                eprintln!(
+                    "Error: --require-attestation requires valid PCR configuration.\n\
+                     Please provide --pcr0, --pcr1, and --pcr2 with valid 96-character hex values."
+                );
+                std::process::exit(1);
+            }
+        };
 
         for (name, val) in [("pcr0", pcr0_val), ("pcr1", pcr1_val), ("pcr2", pcr2_val)] {
             if val.len() != 96 || !val.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -136,37 +134,33 @@ fn setup_enclave(
             }
         }
 
-        let enclave_config = EnclaveConfig {
+        tracing::info!("Enclave enabled with PCR attestation verification");
+        EnclaveConfig {
             expected_pcrs: Some(PcrConfig {
                 pcr0: pcr0_val.clone(),
                 pcr1: pcr1_val.clone(),
                 pcr2: pcr2_val.clone(),
             }),
             ..EnclaveConfig::default()
-        };
-
-        let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
-            eprintln!("Error: Failed to initialize enclave: {}", e);
-            std::process::exit(1);
-        });
-
-        tracing::info!("Enclave enabled with PCR attestation verification");
-        Ok(Some(Arc::new(proxy) as Arc<dyn EnclaveClient>))
+        }
     } else {
         tracing::warn!(
             "Enclave enabled WITHOUT attestation verification - this is insecure for production use"
         );
-        let enclave_config = EnclaveConfig::default();
-        let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
-            eprintln!("Error: Failed to initialize enclave: {}", e);
-            std::process::exit(1);
-        });
-        Ok(Some(Arc::new(proxy) as Arc<dyn EnclaveClient>))
-    }
+        EnclaveConfig::default()
+    };
+
+    let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
+        eprintln!("Error: Failed to initialize enclave: {}", e);
+        std::process::exit(1);
+    });
+
+    Ok(Some(Arc::new(proxy) as Arc<dyn EnclaveClient>))
 }
 
 async fn setup_auth_state(
     stores: &Stores,
+    rate_limit: u32,
 ) -> Result<warden_api::AuthState, Box<dyn std::error::Error>> {
     let jwt_secret = match std::env::var("WARDEN_JWT_SECRET") {
         Ok(secret) if secret.len() >= 32 => secret,
@@ -192,11 +186,6 @@ async fn setup_auth_state(
             }
         }
     };
-
-    let rate_limit = std::env::var("WARDEN_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
 
     let auth_state = match &stores.revoked_token_store {
         Some(store) => {
