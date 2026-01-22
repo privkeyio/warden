@@ -170,8 +170,7 @@ fn resolve_role(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let required_groups = workflow.requirement.all_groups();
 
-    if required_groups.contains(&requested_role.to_string())
-        && group_names.contains(&requested_role.to_string())
+    if required_groups.contains(requested_role) && group_names.contains(&requested_role.to_string())
     {
         return Ok(requested_role.to_string());
     }
