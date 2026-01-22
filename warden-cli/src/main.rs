@@ -119,15 +119,15 @@ enum PolicyAction {
     },
 }
 
-pub struct Stores {
-    pub policy_store: Arc<dyn PolicyStore>,
-    pub whitelist_store: Arc<dyn AddressListStore>,
-    pub blacklist_store: Arc<dyn AddressListStore>,
-    pub approval_store: Arc<dyn ApprovalStore>,
-    pub workflow_store: Arc<dyn WorkflowStore>,
-    pub group_store: Arc<dyn GroupStore>,
-    pub backend_registry: Arc<BackendRegistry>,
-    pub revoked_token_store: Option<Arc<dyn RevokedTokenStore>>,
+pub(crate) struct Stores {
+    pub(crate) policy_store: Arc<dyn PolicyStore>,
+    pub(crate) whitelist_store: Arc<dyn AddressListStore>,
+    pub(crate) blacklist_store: Arc<dyn AddressListStore>,
+    pub(crate) approval_store: Arc<dyn ApprovalStore>,
+    pub(crate) workflow_store: Arc<dyn WorkflowStore>,
+    pub(crate) group_store: Arc<dyn GroupStore>,
+    pub(crate) backend_registry: Arc<BackendRegistry>,
+    pub(crate) revoked_token_store: Option<Arc<dyn RevokedTokenStore>>,
     _storage: Option<RedbStorage>,
 }
 
