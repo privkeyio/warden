@@ -1,17 +1,21 @@
 #![forbid(unsafe_code)]
 
+mod commands;
+
 use clap::{Parser, Subcommand};
+use commands::{
+    handle_approval_action, handle_group_action, handle_list_action, handle_serve_command,
+    ApprovalAction, GroupAction, ListAction,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 #[cfg(feature = "mock")]
 use warden_core::MockSigningBackend;
 use warden_core::{
-    AddressListStore, ApprovalDecision, ApprovalStore, ApproverGroup, BackendRegistry, Config,
-    EnclaveClient, EnclaveConfig, EnclaveProxy, GroupMember, GroupStore, InMemoryAddressListStore,
-    InMemoryApprovalStore, InMemoryGroupStore, InMemoryPolicyStore, InMemoryWorkflowStore,
-    PcrConfig, Policy, PolicyEvaluator, PolicyStore, RedbStorage, RevokedTokenStore,
-    TimeoutChecker, TransactionRequest, WorkflowStore,
+    AddressListStore, ApprovalStore, BackendRegistry, Config, GroupStore, InMemoryAddressListStore,
+    InMemoryApprovalStore, InMemoryGroupStore, InMemoryPolicyStore, InMemoryWorkflowStore, Policy,
+    PolicyEvaluator, PolicyStore, RedbStorage, RevokedTokenStore, TransactionRequest,
+    WorkflowStore,
 };
 
 #[derive(Parser)]
@@ -115,85 +119,15 @@ enum PolicyAction {
     },
 }
 
-#[derive(Subcommand)]
-enum ListAction {
-    List,
-    Create {
-        name: String,
-    },
-    Add {
-        name: String,
-        address: String,
-        #[arg(long)]
-        label: Option<String>,
-    },
-    Remove {
-        name: String,
-        address: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ApprovalAction {
-    List,
-    Get {
-        id: String,
-    },
-    Approve {
-        #[arg(long)]
-        workflow: String,
-        #[arg(long)]
-        approver: String,
-        #[arg(long)]
-        role: String,
-        #[arg(long)]
-        comment: Option<String>,
-    },
-    Reject {
-        #[arg(long)]
-        workflow: String,
-        #[arg(long)]
-        approver: String,
-        #[arg(long)]
-        role: String,
-        #[arg(long)]
-        reason: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum GroupAction {
-    List,
-    Get {
-        name: String,
-    },
-    Create {
-        name: String,
-        #[arg(long)]
-        description: Option<String>,
-    },
-    AddMember {
-        group: String,
-        #[arg(long)]
-        approver: String,
-        #[arg(long)]
-        display_name: Option<String>,
-    },
-    RemoveMember {
-        group: String,
-        approver: String,
-    },
-}
-
-struct Stores {
-    policy_store: Arc<dyn PolicyStore>,
-    whitelist_store: Arc<dyn AddressListStore>,
-    blacklist_store: Arc<dyn AddressListStore>,
-    approval_store: Arc<dyn ApprovalStore>,
-    workflow_store: Arc<dyn WorkflowStore>,
-    group_store: Arc<dyn GroupStore>,
-    backend_registry: Arc<BackendRegistry>,
-    revoked_token_store: Option<Arc<dyn RevokedTokenStore>>,
+pub struct Stores {
+    pub policy_store: Arc<dyn PolicyStore>,
+    pub whitelist_store: Arc<dyn AddressListStore>,
+    pub blacklist_store: Arc<dyn AddressListStore>,
+    pub approval_store: Arc<dyn ApprovalStore>,
+    pub workflow_store: Arc<dyn WorkflowStore>,
+    pub group_store: Arc<dyn GroupStore>,
+    pub backend_registry: Arc<BackendRegistry>,
+    pub revoked_token_store: Option<Arc<dyn RevokedTokenStore>>,
     _storage: Option<RedbStorage>,
 }
 
@@ -258,134 +192,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match cli.command {
-        Commands::Policy { action } => match action {
-            PolicyAction::List => {
-                let policies = stores.policy_store.list().await?;
-                if policies.is_empty() {
-                    println!("No policies found");
-                } else {
-                    for p in policies {
-                        println!(
-                            "{} {} v{} [{}]",
-                            p.id,
-                            p.name,
-                            p.version,
-                            if p.is_active { "active" } else { "inactive" }
-                        );
-                    }
-                }
-            }
-            PolicyAction::Get { id } => {
-                let uuid = uuid::Uuid::parse_str(&id)?;
-                if let Some(policy) = stores.policy_store.get(&uuid).await? {
-                    println!("{}", serde_yaml::to_string(&policy)?);
-                } else {
-                    eprintln!("Policy not found: {}", id);
-                }
-            }
-            PolicyAction::Create { file } => {
-                let content = std::fs::read_to_string(&file)?;
-                let policy = Policy::from_yaml(&content)?;
-                let created = stores.policy_store.create(policy).await?;
-                println!(
-                    "Created policy: {} v{} (id: {})",
-                    created.name, created.version, created.id
-                );
-            }
-            PolicyAction::Validate { file } => {
-                let content = std::fs::read_to_string(&file)?;
-                match Policy::from_yaml(&content) {
-                    Ok(policy) => {
-                        println!("✓ Policy syntax valid");
-                        println!("  Name: {}", policy.name);
-                        println!("  Version: {}", policy.version);
-                        println!("  Rules: {}", policy.rules.len());
-                        for rule in &policy.rules {
-                            if let Some(ref dest) = rule.conditions.destination {
-                                if let Some(ref wl) = dest.in_whitelist {
-                                    println!("  References whitelist: {}", wl);
-                                }
-                                if let Some(ref bl) = dest.in_blacklist {
-                                    println!("  References blacklist: {}", bl);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("✗ Validation failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            PolicyAction::Activate { id } => {
-                let uuid = uuid::Uuid::parse_str(&id)?;
-                stores.policy_store.activate(&uuid).await?;
-                println!("Activated policy: {}", id);
-            }
-            PolicyAction::Deactivate { id } => {
-                let uuid = uuid::Uuid::parse_str(&id)?;
-                stores.policy_store.deactivate(&uuid).await?;
-                println!("Deactivated policy: {}", id);
-            }
-            PolicyAction::Explain { id } => {
-                let uuid = uuid::Uuid::parse_str(&id)?;
-                if let Some(policy) = stores.policy_store.get(&uuid).await? {
-                    println!("Policy: {} (v{})", policy.name, policy.version);
-                    if let Some(desc) = &policy.description {
-                        println!("Description: {}", desc);
-                    }
-                    println!("\nRules ({}):", policy.rules.len());
-                    for (i, rule) in policy.rules.iter().enumerate() {
-                        println!("  {}. {} [{:?}]", i + 1, rule.id, rule.action);
-                        if let Some(desc) = &rule.description {
-                            println!("     {}", desc);
-                        }
-                    }
-                    println!("\nDefault action: {:?}", policy.default_action);
-                } else {
-                    eprintln!("Policy not found: {}", id);
-                }
-            }
-        },
+        Commands::Policy { action } => handle_policy_action(action, &stores).await?,
         Commands::Evaluate {
             wallet,
             destination,
             amount,
             trace,
-        } => {
-            let evaluator = PolicyEvaluator::new(
-                Arc::clone(&stores.policy_store),
-                Arc::clone(&stores.whitelist_store),
-                Arc::clone(&stores.blacklist_store),
-            );
-
-            let request = TransactionRequest::new(wallet, destination, amount);
-
-            match evaluator.evaluate(&request).await {
-                Ok(result) => {
-                    println!("Evaluation Result:");
-                    println!("  Decision: {:?}", result.decision);
-                    println!("  Policy: {} v{}", result.policy_id, result.policy_version);
-                    println!("  Evaluation time: {}μs", result.evaluation_time_us);
-
-                    if trace {
-                        println!("\nTrace:");
-                        for entry in &result.trace {
-                            println!(
-                                "  [{}] {}: {}",
-                                if entry.matched { "MATCH" } else { "NO MATCH" },
-                                entry.rule_id,
-                                entry.details
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Evaluation failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
+        } => handle_evaluate(&stores, wallet, destination, amount, trace).await?,
         Commands::Whitelist { action } => {
             handle_list_action(action, &stores.whitelist_store).await?
         }
@@ -408,477 +221,159 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pcr1,
             pcr2,
         } => {
-            let host_trimmed = host.trim();
-            let is_localhost = matches!(host_trimmed, "127.0.0.1" | "localhost" | "::1" | "[::1]");
-            let has_tls = tls_cert.is_some() && tls_key.is_some();
+            handle_serve_command(
+                &config,
+                &stores,
+                host,
+                port,
+                tls_cert,
+                tls_key,
+                require_tls,
+                enable_enclave,
+                require_attestation,
+                pcr0,
+                pcr1,
+                pcr2,
+            )
+            .await?;
+        }
+    }
 
-            if require_tls && !has_tls && !is_localhost {
-                eprintln!(
-                    "Error: TLS is required for non-localhost bindings. \
-                     Provide --tls-cert and --tls-key, or bind to localhost."
-                );
-                std::process::exit(1);
+    Ok(())
+}
+
+async fn handle_evaluate(
+    stores: &Stores,
+    wallet: String,
+    destination: String,
+    amount: u64,
+    trace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let evaluator = PolicyEvaluator::new(
+        Arc::clone(&stores.policy_store),
+        Arc::clone(&stores.whitelist_store),
+        Arc::clone(&stores.blacklist_store),
+    );
+
+    let request = TransactionRequest::new(wallet, destination, amount);
+
+    match evaluator.evaluate(&request).await {
+        Ok(result) => {
+            println!("Evaluation Result:");
+            println!("  Decision: {:?}", result.decision);
+            println!("  Policy: {} v{}", result.policy_id, result.policy_version);
+            println!("  Evaluation time: {}us", result.evaluation_time_us);
+
+            if trace {
+                println!("\nTrace:");
+                for entry in &result.trace {
+                    println!(
+                        "  [{}] {}: {}",
+                        if entry.matched { "MATCH" } else { "NO MATCH" },
+                        entry.rule_id,
+                        entry.details
+                    );
+                }
             }
+        }
+        Err(e) => {
+            eprintln!("Evaluation failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
 
-            if tls_cert.is_some() != tls_key.is_some() {
-                eprintln!("Error: Both --tls-cert and --tls-key must be provided together.");
-                std::process::exit(1);
+async fn handle_policy_action(
+    action: PolicyAction,
+    stores: &Stores,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        PolicyAction::List => {
+            let policies = stores.policy_store.list().await?;
+            if policies.is_empty() {
+                println!("No policies found");
+            } else {
+                for p in policies {
+                    println!(
+                        "{} {} v{} [{}]",
+                        p.id,
+                        p.name,
+                        p.version,
+                        if p.is_active { "active" } else { "inactive" }
+                    );
+                }
             }
-
-            let enclave_client: Option<Arc<dyn EnclaveClient>> = if enable_enclave {
-                if require_attestation {
-                    let has_all_pcrs = pcr0.is_some() && pcr1.is_some() && pcr2.is_some();
-                    if !has_all_pcrs {
-                        eprintln!(
-                            "Error: --require-attestation requires valid PCR configuration.\n\
-                             Please provide --pcr0, --pcr1, and --pcr2 with valid 96-character hex values."
-                        );
-                        std::process::exit(1);
-                    }
-
-                    let pcr0_val = pcr0.as_ref().unwrap();
-                    let pcr1_val = pcr1.as_ref().unwrap();
-                    let pcr2_val = pcr2.as_ref().unwrap();
-
-                    for (name, val) in [("pcr0", pcr0_val), ("pcr1", pcr1_val), ("pcr2", pcr2_val)]
-                    {
-                        if val.len() != 96 || !val.chars().all(|c| c.is_ascii_hexdigit()) {
-                            eprintln!(
-                                "Error: --{} must be exactly 96 hexadecimal characters (48 bytes). Got {} characters.",
-                                name,
-                                val.len()
-                            );
-                            std::process::exit(1);
+        }
+        PolicyAction::Get { id } => {
+            let uuid = uuid::Uuid::parse_str(&id)?;
+            if let Some(policy) = stores.policy_store.get(&uuid).await? {
+                println!("{}", serde_yaml::to_string(&policy)?);
+            } else {
+                eprintln!("Policy not found: {}", id);
+            }
+        }
+        PolicyAction::Create { file } => {
+            let content = std::fs::read_to_string(&file)?;
+            let policy = Policy::from_yaml(&content)?;
+            let created = stores.policy_store.create(policy).await?;
+            println!(
+                "Created policy: {} v{} (id: {})",
+                created.name, created.version, created.id
+            );
+        }
+        PolicyAction::Validate { file } => {
+            let content = std::fs::read_to_string(&file)?;
+            match Policy::from_yaml(&content) {
+                Ok(policy) => {
+                    println!("Policy syntax valid");
+                    println!("  Name: {}", policy.name);
+                    println!("  Version: {}", policy.version);
+                    println!("  Rules: {}", policy.rules.len());
+                    for rule in &policy.rules {
+                        if let Some(ref dest) = rule.conditions.destination {
+                            if let Some(ref wl) = dest.in_whitelist {
+                                println!("  References whitelist: {}", wl);
+                            }
+                            if let Some(ref bl) = dest.in_blacklist {
+                                println!("  References blacklist: {}", bl);
+                            }
                         }
                     }
-
-                    let enclave_config = EnclaveConfig {
-                        expected_pcrs: Some(PcrConfig {
-                            pcr0: pcr0_val.clone(),
-                            pcr1: pcr1_val.clone(),
-                            pcr2: pcr2_val.clone(),
-                        }),
-                        ..EnclaveConfig::default()
-                    };
-
-                    let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
-                        eprintln!("Error: Failed to initialize enclave: {}", e);
-                        std::process::exit(1);
-                    });
-
-                    tracing::info!("Enclave enabled with PCR attestation verification");
-                    Some(Arc::new(proxy) as Arc<dyn EnclaveClient>)
-                } else {
-                    tracing::warn!(
-                        "Enclave enabled WITHOUT attestation verification - this is insecure for production use"
-                    );
-                    let enclave_config = EnclaveConfig::default();
-                    let proxy = EnclaveProxy::new(enclave_config).unwrap_or_else(|e| {
-                        eprintln!("Error: Failed to initialize enclave: {}", e);
-                        std::process::exit(1);
-                    });
-                    Some(Arc::new(proxy) as Arc<dyn EnclaveClient>)
                 }
-            } else {
-                None
-            };
-
-            let timeout_checker = Arc::new(TimeoutChecker::new(Arc::clone(&stores.workflow_store)));
-            let timeout_handle = Arc::clone(&timeout_checker).spawn();
-            tracing::info!("Started workflow timeout checker");
-
-            let jwt_secret = match std::env::var("WARDEN_JWT_SECRET") {
-                Ok(secret) if secret.len() >= 32 => secret,
-                Ok(secret) => {
-                    eprintln!("Error: WARDEN_JWT_SECRET must be at least 32 characters");
-                    eprintln!("       Current length: {} characters", secret.len());
+                Err(e) => {
+                    eprintln!("Validation failed: {}", e);
                     std::process::exit(1);
                 }
-                Err(_) => {
-                    if std::env::var("WARDEN_INSECURE_DEV").is_ok() {
-                        let mut random_bytes = [0u8; 32];
-                        getrandom::getrandom(&mut random_bytes)
-                            .expect("failed to generate random secret");
-                        let random_secret = hex::encode(random_bytes);
-                        tracing::warn!(
-                            "╔══════════════════════════════════════════════════════════╗"
-                        );
-                        tracing::warn!(
-                            "║  WARNING: Running with randomly generated JWT secret!    ║"
-                        );
-                        tracing::warn!(
-                            "║  Tokens will be invalidated on restart.                  ║"
-                        );
-                        tracing::warn!(
-                            "║  DO NOT USE IN PRODUCTION. Set WARDEN_JWT_SECRET.        ║"
-                        );
-                        tracing::warn!(
-                            "╚══════════════════════════════════════════════════════════╝"
-                        );
-                        random_secret
-                    } else {
-                        eprintln!("Error: WARDEN_JWT_SECRET environment variable is required");
-                        eprintln!("       Set a secret of at least 32 characters");
-                        eprintln!("       For development only, set WARDEN_INSECURE_DEV=1");
-                        std::process::exit(1);
-                    }
-                }
-            };
-            let rate_limit = std::env::var("WARDEN_RATE_LIMIT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100);
-
-            let auth_state = match &stores.revoked_token_store {
-                Some(store) => {
-                    let state = warden_api::AuthState::with_persistent_blacklist(
-                        jwt_secret.as_bytes(),
-                        rate_limit,
-                        Arc::clone(store),
-                    );
-                    let count = state
-                        .load_blacklist()
-                        .await
-                        .map_err(|e| format!("Failed to load revoked tokens from store: {}", e))?;
-                    if count > 0 {
-                        tracing::info!(count, "Loaded revoked tokens from persistent store");
-                    }
-
-                    // Start background sync to pick up revocations from other nodes
-                    let sync_interval = Duration::from_secs(30);
-                    if let Some(handle) = state.start_blacklist_sync(sync_interval) {
-                        tracing::info!(
-                            interval_secs = sync_interval.as_secs(),
-                            "Started blacklist sync task"
-                        );
-                        // The handle is dropped here, allowing the task to run detached.
-                        // In a production system, you might want to track this for graceful shutdown.
-                        drop(handle);
-                    }
-
-                    state
-                }
-                None => warden_api::AuthState::new(jwt_secret.as_bytes(), rate_limit),
-            };
-
-            let state = warden_api::AppState::new(
-                stores.policy_store,
-                stores.whitelist_store,
-                stores.blacklist_store,
-                stores.approval_store,
-                stores.workflow_store,
-                stores.group_store,
-                stores.backend_registry,
-                enclave_client,
-                auth_state,
-            );
-            let app = warden_api::create_router(state);
-            let addr = if host_trimmed.starts_with('[') && host_trimmed.ends_with(']') {
-                format!("{}:{}", host_trimmed, port)
-            } else if host_trimmed.contains(':') {
-                format!("[{}]:{}", host_trimmed, port)
-            } else {
-                format!("{}:{}", host_trimmed, port)
-            };
-
-            let result = if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
-                println!("Starting Warden API server on https://{}", addr);
-                println!("Data directory: {}", config.data_dir.display());
-                println!("Rate limit: {} requests/second", rate_limit);
-
-                let tls_config =
-                    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
-                        .await?;
-
-                axum_server::bind_rustls(addr.parse::<std::net::SocketAddr>()?, tls_config)
-                    .serve(app.into_make_service())
-                    .await
-            } else {
-                if !is_localhost {
-                    if host_trimmed == "0.0.0.0" {
-                        eprintln!(
-                            "Warning: Binding to 0.0.0.0 without TLS exposes the API on ALL network interfaces. \
-                             This is insecure for production. Use --require-tls to enforce TLS."
-                        );
-                    } else {
-                        eprintln!(
-                            "Warning: Running without TLS on non-localhost address. \
-                             Use --require-tls to enforce TLS."
-                        );
-                    }
-                }
-                println!("Starting Warden API server on http://{}", addr);
-                println!("Data directory: {}", config.data_dir.display());
-                println!("Rate limit: {} requests/second", rate_limit);
-                let listener = tokio::net::TcpListener::bind(&addr).await?;
-                axum::serve(listener, app).await
-            };
-            timeout_handle.abort();
-            result?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_list_action(
-    action: ListAction,
-    store: &Arc<dyn AddressListStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        ListAction::List => {
-            let names = store.list_names().await?;
-            if names.is_empty() {
-                println!("No lists found");
-            } else {
-                for name in names {
-                    let entries = store.list_addresses(&name).await?;
-                    println!("{} ({} entries)", name, entries.len());
-                }
             }
         }
-        ListAction::Create { name } => {
-            store.create_list(&name).await?;
-            println!("Created list: {}", name);
-        }
-        ListAction::Add {
-            name,
-            address,
-            label,
-        } => {
-            store.add_address(&name, &address, label.as_deref()).await?;
-            println!("Added {} to {}", address, name);
-        }
-        ListAction::Remove { name, address } => {
-            store.remove_address(&name, &address).await?;
-            println!("Removed {} from {}", address, name);
-        }
-    }
-    Ok(())
-}
-
-async fn handle_approval_action(
-    action: ApprovalAction,
-    workflow_store: &Arc<dyn WorkflowStore>,
-    group_store: &Arc<dyn GroupStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        ApprovalAction::List => {
-            let workflows = workflow_store.list_pending_workflows().await?;
-            if workflows.is_empty() {
-                println!("No pending workflows");
-            } else {
-                for w in workflows {
-                    println!(
-                        "{} [{}] {} sats -> {} (expires: {})",
-                        w.id,
-                        format!("{:?}", w.status).to_uppercase(),
-                        w.transaction_details.amount_sats,
-                        w.transaction_details.destination,
-                        w.expires_at.format("%Y-%m-%d %H:%M UTC")
-                    );
-                }
-            }
-        }
-        ApprovalAction::Get { id } => {
+        PolicyAction::Activate { id } => {
             let uuid = uuid::Uuid::parse_str(&id)?;
-            if let Some(workflow) = workflow_store.get_workflow(&uuid).await? {
-                println!("Workflow: {}", workflow.id);
-                println!("Status: {:?}", workflow.status);
-                println!("Transaction: {}", workflow.transaction_id);
-                println!(
-                    "Amount: {} sats ({:.8} BTC)",
-                    workflow.transaction_details.amount_sats,
-                    workflow.transaction_details.amount_btc()
-                );
-                println!("From: {}", workflow.transaction_details.source_wallet);
-                println!("To: {}", workflow.transaction_details.destination);
-                println!("Created: {}", workflow.created_at);
-                println!("Expires: {}", workflow.expires_at);
-                println!("\nApprovals ({}):", workflow.approvals.len());
-                for a in &workflow.approvals {
-                    println!(
-                        "  {} ({}) - {:?} at {}",
-                        a.approver_id, a.approver_role, a.decision, a.created_at
-                    );
-                }
-                println!("\nQuorum Status: {:?}", workflow.quorum_status());
-            } else {
-                eprintln!("Workflow not found: {}", id);
-            }
+            stores.policy_store.activate(&uuid).await?;
+            println!("Activated policy: {}", id);
         }
-        ApprovalAction::Approve {
-            workflow,
-            approver,
-            role,
-            comment,
-        } => {
-            let uuid = uuid::Uuid::parse_str(&workflow)?;
-            let groups = group_store.get_groups_for_approver(&approver).await?;
-            let group_names: Vec<_> = groups.iter().map(|g| g.name.clone()).collect();
-
-            if let Some(w) = workflow_store.get_workflow(&uuid).await? {
-                if !w.can_approve(&approver, &group_names) {
-                    eprintln!("Approver {} is not authorized for this workflow", approver);
-                    std::process::exit(1);
-                }
-
-                let required_groups = w.requirement.all_groups();
-                let valid_role = if required_groups.contains(&role) && group_names.contains(&role) {
-                    role.clone()
-                } else {
-                    group_names
-                        .iter()
-                        .find(|g| required_groups.contains(*g))
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!(
-                                "Approver {} has no valid role for this workflow. User groups: {:?}, required groups: {:?}",
-                                approver, group_names, required_groups
-                            )
-                        })?
-                };
-
-                let mut approval = warden_core::Approval::new(
-                    approver.clone(),
-                    valid_role.clone(),
-                    ApprovalDecision::Approve,
-                    0,
-                );
-                if let Some(c) = comment {
-                    approval = approval.with_comment(c);
-                }
-
-                let updated = workflow_store
-                    .add_approval_to_workflow(&uuid, approval)
-                    .await?;
-                println!("Approval submitted by {} ({})", approver, valid_role);
-                println!("Workflow status: {:?}", updated.status);
-            } else {
-                eprintln!("Workflow not found: {}", workflow);
-            }
+        PolicyAction::Deactivate { id } => {
+            let uuid = uuid::Uuid::parse_str(&id)?;
+            stores.policy_store.deactivate(&uuid).await?;
+            println!("Deactivated policy: {}", id);
         }
-        ApprovalAction::Reject {
-            workflow,
-            approver,
-            role,
-            reason,
-        } => {
-            let uuid = uuid::Uuid::parse_str(&workflow)?;
-            let groups = group_store.get_groups_for_approver(&approver).await?;
-            let group_names: Vec<_> = groups.iter().map(|g| g.name.clone()).collect();
-
-            if let Some(w) = workflow_store.get_workflow(&uuid).await? {
-                if !w.can_approve(&approver, &group_names) {
-                    eprintln!("Approver {} is not authorized for this workflow", approver);
-                    std::process::exit(1);
-                }
-
-                let required_groups = w.requirement.all_groups();
-                let valid_role = if required_groups.contains(&role) && group_names.contains(&role) {
-                    role.clone()
-                } else {
-                    group_names
-                        .iter()
-                        .find(|g| required_groups.contains(*g))
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!(
-                                "Approver {} has no valid role for this workflow. User groups: {:?}, required groups: {:?}",
-                                approver, group_names, required_groups
-                            )
-                        })?
-                };
-
-                let mut rejection = warden_core::Approval::new(
-                    approver.clone(),
-                    valid_role.clone(),
-                    ApprovalDecision::Reject,
-                    0,
-                );
-                if let Some(r) = reason {
-                    rejection = rejection.with_comment(r);
-                }
-
-                let updated = workflow_store
-                    .add_approval_to_workflow(&uuid, rejection)
-                    .await?;
-                println!("Rejection submitted by {} ({})", approver, valid_role);
-                println!("Workflow status: {:?}", updated.status);
-            } else {
-                eprintln!("Workflow not found: {}", workflow);
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_group_action(
-    action: GroupAction,
-    group_store: &Arc<dyn GroupStore>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        GroupAction::List => {
-            let groups = group_store.list().await?;
-            if groups.is_empty() {
-                println!("No groups found");
-            } else {
-                for g in groups {
-                    println!("{} ({} members)", g.name, g.members.len());
-                }
-            }
-        }
-        GroupAction::Get { name } => {
-            if let Some(group) = group_store.get_by_name(&name).await? {
-                println!("Group: {}", group.name);
-                if let Some(desc) = &group.description {
+        PolicyAction::Explain { id } => {
+            let uuid = uuid::Uuid::parse_str(&id)?;
+            if let Some(policy) = stores.policy_store.get(&uuid).await? {
+                println!("Policy: {} (v{})", policy.name, policy.version);
+                if let Some(desc) = &policy.description {
                     println!("Description: {}", desc);
                 }
-                println!("Created: {}", group.created_at);
-                println!("\nMembers ({}):", group.members.len());
-                for m in &group.members {
-                    let display = m
-                        .display_name
-                        .as_ref()
-                        .map(|n| format!(" ({})", n))
-                        .unwrap_or_default();
-                    println!("  {}{} - added {}", m.approver_id, display, m.added_at);
+                println!("\nRules ({}):", policy.rules.len());
+                for (i, rule) in policy.rules.iter().enumerate() {
+                    println!("  {}. {} [{:?}]", i + 1, rule.id, rule.action);
+                    if let Some(desc) = &rule.description {
+                        println!("     {}", desc);
+                    }
                 }
+                println!("\nDefault action: {:?}", policy.default_action);
             } else {
-                eprintln!("Group not found: {}", name);
-            }
-        }
-        GroupAction::Create { name, description } => {
-            let mut group = ApproverGroup::new(name.clone());
-            if let Some(desc) = description {
-                group = group.with_description(desc);
-            }
-            let created = group_store.create(group).await?;
-            println!("Created group: {} (id: {})", created.name, created.id);
-        }
-        GroupAction::AddMember {
-            group,
-            approver,
-            display_name,
-        } => {
-            if let Some(g) = group_store.get_by_name(&group).await? {
-                let mut member = GroupMember::new(approver.clone());
-                if let Some(name) = display_name {
-                    member = member.with_display_name(name);
-                }
-
-                group_store.add_member(&g.id, member).await?;
-                println!("Added {} to group {}", approver, group);
-            } else {
-                eprintln!("Group not found: {}", group);
-            }
-        }
-        GroupAction::RemoveMember { group, approver } => {
-            if let Some(g) = group_store.get_by_name(&group).await? {
-                group_store.remove_member(&g.id, &approver).await?;
-                println!("Removed {} from group {}", approver, group);
-            } else {
-                eprintln!("Group not found: {}", group);
+                eprintln!("Policy not found: {}", id);
             }
         }
     }
