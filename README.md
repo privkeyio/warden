@@ -225,4 +225,4 @@ RUST_LOG=debug cargo run --bin warden -- <command>
 
 ## License
 
-AGPL-3.0
+MIT
